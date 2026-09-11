@@ -1,0 +1,11 @@
+# Local secrets and exported account configuration
+.env
+.env.*
+!.env.example
+*.json
+*.log
+*.bak
+*.backup
+node_modules/
+.DS_Store
+Thumbs.db

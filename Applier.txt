@@ -1,0 +1,4454 @@
+// ==UserScript==
+// @name         Zoom Settings Applier
+// @namespace    zoom.settings.applier
+// @version      9.1
+// @description  Applies exported Zoom account settings with fast event-driven waits plus robust nested My Notes / Deprecated Notes handling.
+// @match        https://zoom.us/account/setting*
+// @match        https://*.zoom.us/account/setting*
+// @match        https://zoom.us/account/integration*
+// @match        https://*.zoom.us/account/integration*
+// @grant        GM_addStyle
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  const CONTROL_SELECTOR = [
+    '[role="switch"]',
+    'input[type="checkbox"]',
+    '[role="checkbox"]',
+    'input[type="radio"]',
+    '[role="radio"]',
+    'input[type="number"]',
+    'input[type="text"]',
+    'input:not([type])',
+    'textarea',
+    'select',
+    '[role="combobox"]',
+  ].join(',');
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const nextFrame = () => new Promise((resolve) => requestAnimationFrame(resolve));
+
+  function waitFor(conditionFn, timeout = 4000, interval = 60) {
+    return new Promise((resolve) => {
+      const start = Date.now();
+
+      (function poll() {
+        let result;
+
+        try {
+          result = conditionFn();
+        } catch (_) {
+          result = null;
+        }
+
+        if (result) return resolve(result);
+        if (Date.now() - start >= timeout) return resolve(null);
+
+        setTimeout(poll, interval);
+      })();
+    });
+  }
+
+  function waitForDomQuiet(root, quietMs = 35, maxWait = 320) {
+    const target = root?.nodeType ? root : document.body;
+
+    if (!target || typeof MutationObserver === "undefined") {
+      return sleep(quietMs);
+    }
+
+    return new Promise((resolve) => {
+      let finished = false;
+      let quietTimer = null;
+      let maxTimer = null;
+
+      const finish = () => {
+        if (finished) return;
+
+        finished = true;
+
+        observer.disconnect();
+        clearTimeout(quietTimer);
+        clearTimeout(maxTimer);
+
+        resolve();
+      };
+
+      const touch = () => {
+        clearTimeout(quietTimer);
+        quietTimer = setTimeout(finish, quietMs);
+      };
+
+      const observer = new MutationObserver(touch);
+
+      observer.observe(target, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+      });
+
+      touch();
+
+      maxTimer = setTimeout(finish, maxWait);
+    });
+  }
+
+  function cleanText(text) {
+    return (text || "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function cleanLower(text) {
+    return cleanText(text).toLowerCase();
+  }
+
+  function isVisible(el) {
+    if (!el) return false;
+
+    const rect = el.getBoundingClientRect();
+
+    return (
+      rect.width > 0 &&
+      rect.height > 0 &&
+      el.offsetParent !== null
+    );
+  }
+
+  const SKIP_TABS = [
+    "webinar",
+    "events",
+    "mail",
+    "calendar",
+    "zoom chat",
+    "team chat",
+  ];
+
+  GM_addStyle(`
+    #zsa-panel {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      z-index: 999999999;
+      font-family: Arial, sans-serif;
+      width: 560px;
+    }
+
+    #zsa-log {
+      width: 100%;
+      max-height: 420px;
+      overflow-y: auto;
+      background: #0f172a;
+      color: #e2e8f0;
+      border-radius: 12px;
+      border: 2px solid #7c3aed;
+      padding: 12px 14px;
+      margin-bottom: 10px;
+      display: none;
+      white-space: pre-wrap;
+      font-size: 12px;
+      line-height: 1.6;
+      box-sizing: border-box;
+    }
+
+    #zsa-log .ok {
+      color: #4ade80;
+    }
+
+    #zsa-log .done {
+      color: #86efac;
+    }
+
+    #zsa-log .skip {
+      color: #94a3b8;
+    }
+
+    #zsa-log .warn {
+      color: #fbbf24;
+    }
+
+    #zsa-log .lock {
+      color: #c084fc;
+    }
+
+    #zsa-log .head {
+      color: #67e8f9;
+      font-weight: bold;
+    }
+
+    #zsa-log .sum {
+      color: #f0abfc;
+    }
+
+    #zsa-log .err {
+      color: #f87171;
+    }
+
+    #zsa-controls {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    #zsa-file-label {
+      flex: 1;
+      background: #1e293b;
+      color: #94a3b8;
+      border: 1px dashed #475569;
+      border-radius: 10px;
+      padding: 10px 14px;
+      font-size: 12px;
+      cursor: pointer;
+      text-align: center;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    #zsa-file-label.loaded {
+      color: #4ade80;
+      border-color: #4ade80;
+    }
+
+    #zsa-file {
+      display: none;
+    }
+
+    #zsa-apply-btn {
+      background: linear-gradient(135deg, #7c3aed, #d946ef);
+      color: white;
+      border: none;
+      border-radius: 10px;
+      padding: 11px 18px;
+      font-weight: 800;
+      font-size: 13px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    #zsa-apply-btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+
+    #zsa-status {
+      width: 100%;
+      text-align: center;
+      color: #94a3b8;
+      font-size: 11px;
+      margin-top: 6px;
+      display: none;
+    }
+  `);
+
+  const panel = document.createElement("div");
+
+  panel.id = "zsa-panel";
+
+  panel.innerHTML = `
+    <div id="zsa-log"></div>
+
+    <div id="zsa-controls">
+      <label id="zsa-file-label" for="zsa-file">
+        📂 Load settings JSON
+      </label>
+
+      <input
+        type="file"
+        id="zsa-file"
+        accept=".json"
+      >
+
+      <button
+        id="zsa-apply-btn"
+        disabled
+      >
+        ⚙ Apply
+      </button>
+    </div>
+
+    <div id="zsa-status"></div>
+  `;
+
+  document.body.appendChild(panel);
+
+  const fileInput =
+    document.getElementById("zsa-file");
+
+  const fileLabel =
+    document.getElementById("zsa-file-label");
+
+  const applyBtn =
+    document.getElementById("zsa-apply-btn");
+
+  const logEl =
+    document.getElementById("zsa-log");
+
+  const statusEl =
+    document.getElementById("zsa-status");
+
+  let TEMPLATE = null;
+
+  let pendingLogLines =
+    document.createDocumentFragment();
+
+  let logFlushScheduled = false;
+
+  function flushLog() {
+    if (
+      !pendingLogLines.childNodes.length
+    ) {
+      logFlushScheduled = false;
+      return;
+    }
+
+    logEl.appendChild(
+      pendingLogLines
+    );
+
+    pendingLogLines =
+      document.createDocumentFragment();
+
+    logEl.scrollTop =
+      logEl.scrollHeight;
+
+    logFlushScheduled = false;
+  }
+
+  function log(msg, cls) {
+    logEl.style.display =
+      "block";
+
+    const line =
+      document.createElement("div");
+
+    if (cls) {
+      line.className = cls;
+    }
+
+    line.textContent = msg;
+
+    pendingLogLines.appendChild(
+      line
+    );
+
+    if (!logFlushScheduled) {
+      logFlushScheduled = true;
+
+      requestAnimationFrame(
+        flushLog
+      );
+    }
+  }
+
+  function setStatus(msg) {
+    statusEl.style.display =
+      "block";
+
+    statusEl.textContent =
+      msg;
+  }
+
+  fileInput.addEventListener(
+    "change",
+    (e) => {
+      const file =
+        e.target.files[0];
+
+      if (!file) return;
+
+      const reader =
+        new FileReader();
+
+      reader.onload =
+        (ev) => {
+          try {
+            TEMPLATE =
+              JSON.parse(
+                ev.target.result
+              );
+
+            if (
+              !Array.isArray(
+                TEMPLATE
+              )
+            ) {
+              throw new Error(
+                "JSON must be an array"
+              );
+            }
+
+            fileLabel.textContent =
+              `✅ ${file.name} (${TEMPLATE.length} settings)`;
+
+            fileLabel.classList.add(
+              "loaded"
+            );
+
+            applyBtn.disabled =
+              false;
+
+            setStatus(
+              `Loaded ${TEMPLATE.length} settings. Click Apply to start.`
+            );
+          }
+          catch (err) {
+            fileLabel.textContent =
+              "❌ Invalid JSON — try again";
+
+            fileLabel.classList.remove(
+              "loaded"
+            );
+
+            applyBtn.disabled =
+              true;
+
+            TEMPLATE =
+              null;
+
+            setStatus(
+              "Error: " + err.message
+            );
+          }
+        };
+
+      reader.readAsText(
+        file
+      );
+    }
+  );
+
+  async function expandAll(
+    scope,
+    maxPasses = 6
+  ) {
+    const root =
+      scope || document;
+
+    const clicked =
+      new WeakSet();
+
+    for (
+      let pass = 0;
+      pass < maxPasses;
+      pass++
+    ) {
+      const candidates =
+        Array.from(
+          root.querySelectorAll(
+            'button, [role="button"]'
+          )
+        )
+          .filter(
+            (el) =>
+              isVisible(el) &&
+              !clicked.has(el)
+          );
+
+      let clickedAny =
+        false;
+
+      for (
+        const el of candidates
+      ) {
+        const txt =
+          cleanLower(
+            el.innerText || ""
+          );
+
+        if (
+          el.closest('[class*="header"]') ||
+          el.closest('[class*="topbar"]') ||
+          el.closest('[class*="profile"]') ||
+          el.closest('[class*="avatar"]') ||
+          el.closest('[class*="account"]') ||
+          txt.includes("sign out") ||
+          txt.includes("billing") ||
+          txt.includes("account")
+        ) {
+          continue;
+        }
+
+        const expanded =
+          el.getAttribute(
+            "aria-expanded"
+          );
+
+        if (
+          expanded === "false" ||
+          txt.includes("show more") ||
+          txt.includes("see more") ||
+          txt.includes("advanced") ||
+          txt === "expand"
+        ) {
+          try {
+            clicked.add(el);
+
+            el.click();
+
+            clickedAny =
+              true;
+          }
+          catch (_) {}
+        }
+      }
+
+      if (!clickedAny) {
+        break;
+      }
+
+      await waitForDomQuiet(
+        root,
+        35,
+        300
+      );
+
+      for (
+        const el of candidates
+      ) {
+        if (
+          el.isConnected &&
+          el.getAttribute(
+            "aria-expanded"
+          ) === "false"
+        ) {
+          clicked.delete(el);
+        }
+      }
+    }
+  }
+
+  function getSidebarTabs() {
+    return Array.from(
+      document.querySelectorAll(
+        '.zoom-tabs__item, .tabs-item, [role="tab"], li[class*="tab"]'
+      )
+    )
+      .filter(
+        (el) =>
+          isVisible(el) &&
+          el.innerText &&
+          el.innerText.trim().length > 0
+      );
+  }
+
+  function isTabSelected(tabEl) {
+    return (
+      tabEl.getAttribute(
+        "aria-selected"
+      ) === "true" ||
+      /(^|[-_\s])(active|selected)([-_\s]|$)/i.test(
+        String(
+          tabEl.className || ""
+        )
+      )
+    );
+  }
+
+  function getNestedTabCandidates(
+    name,
+    outerTab
+  ) {
+    const wanted =
+      cleanLower(name);
+
+    const outerTabList =
+      outerTab?.closest(
+        '[role="tablist"]'
+      );
+
+    const selector = [
+      '[role="tab"]',
+      'button',
+      '[role="button"]',
+      'a',
+      'li[class*="tab"]',
+      '[class*="tabs-item"]',
+      '[class*="tab-item"]',
+      '[aria-controls]',
+      '[data-testid*="tab"]'
+    ].join(',');
+
+    const exact =
+      Array.from(
+        document.querySelectorAll(
+          selector
+        )
+      )
+        .filter(
+          (el) => {
+            if (
+              !isVisible(el) ||
+              el === outerTab ||
+              el.closest(
+                '#zsa-panel'
+              )
+            ) {
+              return false;
+            }
+
+            const txt =
+              cleanLower(
+                el.innerText ||
+                el.textContent ||
+                el.getAttribute(
+                  'aria-label'
+                ) ||
+                ''
+              );
+
+            if (
+              txt !== wanted
+            ) {
+              return false;
+            }
+
+            const inSidebar =
+              !!el.closest(
+                'aside, nav, [class*="sidebar"], [class*="left-nav"], [class*="setting-nav"]'
+              );
+
+            const tabList =
+              el.closest(
+                '[role="tablist"]'
+              );
+
+            if (
+              inSidebar &&
+              (
+                !tabList ||
+                tabList === outerTabList
+              )
+            ) {
+              return false;
+            }
+
+            return true;
+          }
+        );
+
+    exact.sort(
+      (a, b) => {
+        const score =
+          (el) => {
+            let s = 0;
+
+            if (
+              el.getAttribute(
+                'role'
+              ) === 'tab'
+            ) {
+              s += 10;
+            }
+
+            if (
+              el.closest(
+                '[role="tablist"]'
+              ) &&
+              el.closest(
+                '[role="tablist"]'
+              ) !== outerTabList
+            ) {
+              s += 8;
+            }
+
+            if (
+              !el.closest(
+                'aside, nav, [class*="sidebar"], [class*="left-nav"], [class*="setting-nav"]'
+              )
+            ) {
+              s += 6;
+            }
+
+            if (
+              el.tagName ===
+                'BUTTON' ||
+              el.getAttribute(
+                'role'
+              ) === 'button'
+            ) {
+              s += 3;
+            }
+
+            if (
+              el.hasAttribute(
+                'aria-controls'
+              )
+            ) {
+              s += 2;
+            }
+
+            return s;
+          };
+
+        return (
+          score(b) -
+          score(a)
+        );
+      }
+    );
+
+    return exact;
+  }
+
+  async function waitForNestedTab(
+    name,
+    outerTab,
+    timeout = 3500
+  ) {
+    return await waitFor(
+      () =>
+        getNestedTabCandidates(
+          name,
+          outerTab
+        )[0] || null,
+      timeout,
+      50
+    );
+  }
+
+  async function openNestedTab(
+    name,
+    outerTab
+  ) {
+    let tab =
+      await waitForNestedTab(
+        name,
+        outerTab,
+        3500
+      );
+
+    if (!tab) {
+      return null;
+    }
+
+    tab.scrollIntoView({
+      behavior: "instant",
+      block: "center"
+    });
+
+    tab.click();
+
+    await waitFor(
+      () => {
+        const current =
+          getNestedTabCandidates(
+            name,
+            outerTab
+          )[0];
+
+        if (!current) {
+          return null;
+        }
+
+        return (
+          isTabSelected(
+            current
+          ) ||
+          current.getAttribute(
+            'aria-selected'
+          ) === 'true' ||
+          current.getAttribute(
+            'aria-current'
+          ) === 'page' ||
+          /(^|[-_\s])(active|selected)([-_\s]|$)/i.test(
+            String(
+              current.className || ''
+            )
+          )
+        )
+          ? current
+          : null;
+      },
+      1200,
+      35
+    );
+
+    await waitForDomQuiet(
+      document.body,
+      55,
+      500
+    );
+
+    const activePanel =
+      getActivePanel();
+
+    await expandAll(
+      activePanel
+    );
+
+    const targets =
+      getScrollTargets(
+        activePanel
+      );
+
+    if (targets.length) {
+      let previous =
+        getVisibleControls(
+          getActivePanel()
+        ).length;
+
+      for (
+        let pass = 0;
+        pass < 5;
+        pass++
+      ) {
+        for (
+          const target of
+          getScrollTargets(
+            getActivePanel()
+          )
+        ) {
+          target.scrollTop =
+            target.scrollHeight;
+        }
+
+        window.scrollTo(
+          0,
+          document.documentElement.scrollHeight
+        );
+
+        await waitForDomQuiet(
+          getActivePanel(),
+          45,
+          320
+        );
+
+        await expandAll(
+          getActivePanel()
+        );
+
+        const count =
+          getVisibleControls(
+            getActivePanel()
+          ).length;
+
+        if (
+          count === previous
+        ) {
+          break;
+        }
+
+        previous =
+          count;
+      }
+
+      for (
+        const target of
+        getScrollTargets(
+          getActivePanel()
+        )
+      ) {
+        target.scrollTop = 0;
+      }
+
+      window.scrollTo(
+        0,
+        0
+      );
+
+      await nextFrame();
+    }
+
+    return (
+      getNestedTabCandidates(
+        name,
+        outerTab
+      )[0] || tab
+    );
+  }
+  function getActivePanel() {
+    const panels = Array.from(
+      document.querySelectorAll(
+        '[role="tabpanel"], .tab-panel, .tabs-panel, [class*="tab-content"]'
+      )
+    ).filter((panel) =>
+      isVisible(panel) &&
+      panel.getAttribute("aria-hidden") !== "true" &&
+      !panel.hidden
+    );
+
+    if (!panels.length) {
+      return document.body;
+    }
+
+    panels.sort(
+      (a, b) =>
+        b.querySelectorAll(CONTROL_SELECTOR).length -
+        a.querySelectorAll(CONTROL_SELECTOR).length
+    );
+
+    return panels[0];
+  }
+
+  function getVisibleControls(root) {
+    return Array.from(
+      (root || document).querySelectorAll(
+        CONTROL_SELECTOR
+      )
+    ).filter(
+      (el) =>
+        isVisible(el) &&
+        !el.closest("#zsa-panel")
+    );
+  }
+
+  function getScrollTargets(panel) {
+    const candidates = [
+      document.scrollingElement,
+      document.documentElement,
+      document.body
+    ];
+
+    let node = panel;
+
+    while (node) {
+      candidates.push(node);
+
+      node =
+        node.parentElement;
+    }
+
+    const searchRoot =
+      panel &&
+      panel !== document.body
+        ? panel
+        : document;
+
+    const nestedSelector =
+      panel &&
+      panel !== document.body
+        ? '.settings-content, main, [class*="content-wrapper"], [class*="main-content"], [class*="scroll"]'
+        : '.settings-content, main, [class*="content-wrapper"], [class*="main-content"]';
+
+    searchRoot
+      .querySelectorAll(
+        nestedSelector
+      )
+      .forEach(
+        (el) =>
+          candidates.push(el)
+      );
+
+    return [
+      ...new Set(candidates)
+    ].filter(
+      (el) => {
+        const isDocumentScroller =
+          el ===
+            document.scrollingElement ||
+          el ===
+            document.documentElement ||
+          el ===
+            document.body;
+
+        return (
+          el &&
+          (
+            isDocumentScroller ||
+            isVisible(el)
+          ) &&
+          el.scrollHeight >
+            el.clientHeight + 40
+        );
+      }
+    );
+  }
+
+  async function openTab(tabEl) {
+    const beforePanel =
+      getActivePanel();
+
+    const beforeControls =
+      new Set(
+        getVisibleControls(
+          beforePanel
+        )
+      );
+
+    const wasSelected =
+      isTabSelected(tabEl);
+
+    tabEl.scrollIntoView({
+      behavior: "instant",
+      block: "center"
+    });
+
+    tabEl.click();
+
+    await waitFor(
+      () => {
+        const panel =
+          getActivePanel();
+
+        const controlsChanged =
+          getVisibleControls(
+            panel
+          ).some(
+            (el) =>
+              !beforeControls.has(el)
+          );
+
+        return (
+          isTabSelected(tabEl) ||
+          panel !== beforePanel ||
+          controlsChanged
+        )
+          ? true
+          : null;
+      },
+      900,
+      30
+    );
+
+    if (!wasSelected) {
+      await waitFor(
+        () => {
+          const panel =
+            getActivePanel();
+
+          const controlsChanged =
+            getVisibleControls(
+              panel
+            ).some(
+              (el) =>
+                !beforeControls.has(el)
+            );
+
+          return (
+            panel !== beforePanel ||
+            controlsChanged
+          )
+            ? true
+            : null;
+        },
+        500,
+        25
+      );
+    }
+
+    await waitForDomQuiet(
+      document.body,
+      45,
+      400
+    );
+
+    const activePanel =
+      getActivePanel();
+
+    await expandAll(
+      activePanel
+    );
+
+    let targets =
+      getScrollTargets(
+        activePanel
+      );
+
+    if (!targets.length) {
+      return;
+    }
+
+    let stablePasses = 0;
+
+    let previousControlCount =
+      getVisibleControls(
+        activePanel
+      ).length;
+
+    for (
+      let pass = 0;
+      pass < 8 &&
+      stablePasses < 1;
+      pass++
+    ) {
+      const panel =
+        getActivePanel();
+
+      targets =
+        getScrollTargets(
+          panel
+        );
+
+      if (!targets.length) {
+        break;
+      }
+
+      for (
+        const target of targets
+      ) {
+        target.scrollTop =
+          target.scrollHeight;
+      }
+
+      window.scrollTo(
+        0,
+        document.documentElement
+          .scrollHeight
+      );
+
+      await waitForDomQuiet(
+        panel,
+        45,
+        350
+      );
+
+      await expandAll(
+        getActivePanel()
+      );
+
+      const count =
+        getVisibleControls(
+          getActivePanel()
+        ).length;
+
+      stablePasses =
+        count ===
+        previousControlCount
+          ? stablePasses + 1
+          : 0;
+
+      previousControlCount =
+        count;
+    }
+
+    for (
+      const target of
+      getScrollTargets(
+        getActivePanel()
+      )
+    ) {
+      target.scrollTop = 0;
+    }
+
+    window.scrollTo(
+      0,
+      0
+    );
+
+    await nextFrame();
+  }
+
+  function extractLabel(
+    controlEl
+  ) {
+    let node =
+      controlEl;
+
+    for (
+      let depth = 0;
+      depth < 12;
+      depth++
+    ) {
+      node =
+        node.parentElement;
+
+      if (!node) {
+        break;
+      }
+
+      if (
+        node.classList.contains(
+          "zoom-feature-settings__layout"
+        ) ||
+        node.classList.contains(
+          "zoom-feature-settings__layout-row"
+        ) ||
+        (
+          node.id &&
+          node.id.startsWith(
+            "feature-"
+          )
+        )
+      ) {
+        const nameEl =
+          node.querySelector(
+            ".zoom-feature-settings__name"
+          ) ||
+          node.querySelector(
+            'h4[id$="-title"]'
+          ) ||
+          node.querySelector(
+            "h4"
+          );
+
+        if (nameEl) {
+          const clone =
+            nameEl.cloneNode(true);
+
+          clone
+            .querySelectorAll(
+              '.zoom-badge, .badge, [class*="badge"], [class*="tag"], [aria-hidden]'
+            )
+            .forEach(
+              (b) =>
+                b.remove()
+            );
+
+          const text =
+            cleanText(
+              clone.innerText ||
+              clone.textContent ||
+              ""
+            );
+
+          if (
+            text.length > 2 &&
+            text.length < 120
+          ) {
+            return text;
+          }
+        }
+
+        break;
+      }
+    }
+
+    const ariaLabel =
+      cleanText(
+        controlEl.getAttribute(
+          "aria-label"
+        ) || ""
+      );
+
+    const cleaned =
+      ariaLabel
+        .replace(
+          /,\s*(NEW|BETA|PREMIUM)$/i,
+          ""
+        )
+        .trim();
+
+    if (
+      cleaned.length > 2 &&
+      cleaned.length < 120
+    ) {
+      return cleaned;
+    }
+
+    return "UNKNOWN";
+  }
+
+  function getFeatureContainer(
+    el
+  ) {
+    let node = el;
+
+    for (
+      let depth = 0;
+      depth < 12;
+      depth++
+    ) {
+      node =
+        node.parentElement;
+
+      if (!node) {
+        break;
+      }
+
+      if (
+        node.classList.contains(
+          "zoom-feature-settings__layout"
+        ) ||
+        node.classList.contains(
+          "zoom-feature-settings__layout-row"
+        ) ||
+        (
+          node.id &&
+          node.id.startsWith(
+            "feature-"
+          )
+        )
+      ) {
+        return node;
+      }
+    }
+
+    return null;
+  }
+
+  function extractFeatureName(
+    el
+  ) {
+    const node =
+      getFeatureContainer(el);
+
+    if (!node) {
+      return "";
+    }
+
+    const nameEl =
+      node.querySelector(
+        ".zoom-feature-settings__name"
+      ) ||
+      node.querySelector(
+        'h4[id$="-title"]'
+      ) ||
+      node.querySelector(
+        "h4"
+      );
+
+    if (!nameEl) {
+      return "";
+    }
+
+    const clone =
+      nameEl.cloneNode(true);
+
+    clone
+      .querySelectorAll(
+        '.zoom-badge, .badge, [class*="badge"], [class*="tag"], [aria-hidden]'
+      )
+      .forEach(
+        (b) =>
+          b.remove()
+      );
+
+    return cleanText(
+      clone.innerText ||
+      clone.textContent ||
+      ""
+    );
+  }
+
+  function extractInlineLabel(
+    el
+  ) {
+    const id =
+      el.getAttribute("id");
+
+    if (id) {
+      const direct =
+        document.querySelector(
+          `label[for="${CSS.escape(id)}"]`
+        );
+
+      const directText =
+        cleanText(
+          direct?.innerText ||
+          direct?.textContent ||
+          ""
+        );
+
+      if (directText) {
+        return directText;
+      }
+    }
+
+    const wrappingLabel =
+      el.closest("label");
+
+    const wrappingText =
+      cleanText(
+        wrappingLabel?.innerText ||
+        wrappingLabel?.textContent ||
+        ""
+      );
+
+    if (wrappingText) {
+      return wrappingText;
+    }
+
+    let sibling =
+      el.nextElementSibling;
+
+    for (
+      let i = 0;
+      sibling && i < 3;
+      i++,
+      sibling =
+        sibling.nextElementSibling
+    ) {
+      const txt =
+        cleanText(
+          sibling.innerText ||
+          sibling.textContent ||
+          ""
+        );
+
+      if (
+        txt &&
+        txt.length < 160
+      ) {
+        return txt;
+      }
+    }
+
+    const parentText =
+      cleanText(
+        el.parentElement?.innerText ||
+        el.parentElement?.textContent ||
+        ""
+      );
+
+    if (
+      parentText &&
+      parentText.length < 180
+    ) {
+      return parentText;
+    }
+
+    return "";
+  }
+
+  function extractTextBeforeElement(
+    el
+  ) {
+    const parent =
+      el.parentElement;
+
+    if (!parent) {
+      return "";
+    }
+
+    try {
+      const range =
+        document.createRange();
+
+      range.setStart(
+        parent,
+        0
+      );
+
+      range.setEndBefore(
+        el
+      );
+
+      return cleanText(
+        range.toString()
+      ).replace(
+        /[:\s]+$/,
+        ""
+      );
+    }
+    catch (_) {
+      return "";
+    }
+  }
+
+  function extractCheckboxLabel(
+    cb
+  ) {
+    const inline =
+      extractInlineLabel(cb);
+
+    const feature =
+      extractFeatureName(cb);
+
+    if (
+      inline &&
+      feature &&
+      inline.toLowerCase() !==
+        feature.toLowerCase()
+    ) {
+      return `${feature} / ${inline}`;
+    }
+
+    return (
+      inline ||
+      feature ||
+      "UNKNOWN"
+    );
+  }
+
+  function getCheckedState(
+    el
+  ) {
+    const checked =
+      el.getAttribute(
+        "aria-checked"
+      );
+
+    if (
+      checked === "true"
+    ) {
+      return true;
+    }
+
+    if (
+      checked === "false"
+    ) {
+      return false;
+    }
+
+    return (
+      el.checked === true
+    );
+  }
+
+  function getRadioGroup(
+    rad
+  ) {
+    const name =
+      rad.getAttribute(
+        "name"
+      );
+
+    if (name) {
+      const radios =
+        Array.from(
+          document.querySelectorAll(
+            `input[type="radio"][name="${CSS.escape(name)}"], [role="radio"][name="${CSS.escape(name)}"]`
+          )
+        ).filter(
+          isVisible
+        );
+
+      if (
+        radios.length > 0
+      ) {
+        return radios;
+      }
+    }
+
+    let node =
+      rad.parentElement;
+
+    for (
+      let depth = 0;
+      node &&
+      depth < 10;
+      depth++,
+      node =
+        node.parentElement
+    ) {
+      const radios =
+        Array.from(
+          node.querySelectorAll(
+            'input[type="radio"], [role="radio"]'
+          )
+        ).filter(
+          isVisible
+        );
+
+      if (
+        radios.length > 1
+      ) {
+        return radios;
+      }
+    }
+
+    return [rad];
+  }
+
+  function extractRadioOptionLabel(
+    rad
+  ) {
+    return (
+      extractInlineLabel(rad) ||
+      cleanText(
+        rad.getAttribute(
+          "aria-label"
+        ) || ""
+      )
+    );
+  }
+
+  function extractRadioGroupLabel(
+    rad,
+    radios
+  ) {
+    const feature =
+      extractFeatureName(rad);
+
+    let group =
+      rad.parentElement;
+
+    for (
+      let depth = 0;
+      group &&
+      depth < 10;
+      depth++,
+      group =
+        group.parentElement
+    ) {
+      const groupRadios =
+        Array.from(
+          group.querySelectorAll(
+            'input[type="radio"], [role="radio"]'
+          )
+        ).filter(
+          isVisible
+        );
+
+      if (
+        groupRadios.length >=
+        radios.length
+      ) {
+        break;
+      }
+    }
+
+    let text =
+      cleanText(
+        group?.innerText ||
+        group?.textContent ||
+        ""
+      );
+
+    for (
+      const option of
+      radios
+        .map(
+          extractRadioOptionLabel
+        )
+        .filter(Boolean)
+    ) {
+      text =
+        cleanText(
+          text.replace(
+            option,
+            " "
+          )
+        );
+    }
+
+    text =
+      cleanText(
+        text
+          .replace(
+            /\?/g,
+            "? "
+          )
+          .replace(
+            /\s+/g,
+            " "
+          )
+      );
+
+    if (
+      text.length > 2 &&
+      text.length < 180
+    ) {
+      return (
+        feature &&
+        !text.includes(feature)
+          ? `${feature} / ${text}`
+          : text
+      );
+    }
+
+    return (
+      feature ||
+      cleanText(
+        rad.getAttribute(
+          "aria-label"
+        ) || ""
+      ) ||
+      "UNKNOWN"
+    );
+  }
+
+  function extractNumberLabel(
+    input
+  ) {
+    const before =
+      extractTextBeforeElement(
+        input
+      );
+
+    const inline =
+      before &&
+      before.length < 80
+        ? before
+        : extractInlineLabel(
+            input
+          );
+
+    const feature =
+      extractFeatureName(
+        input
+      );
+
+    if (
+      inline &&
+      feature &&
+      inline.toLowerCase() !==
+        feature.toLowerCase()
+    ) {
+      return (
+        `${feature} / ${inline.replace(
+          /:$/,
+          ""
+        )}`
+      );
+    }
+
+    return (
+      inline ||
+      feature ||
+      cleanText(
+        input.getAttribute(
+          "aria-label"
+        ) || ""
+      ) ||
+      "UNKNOWN"
+    );
+  }
+
+  function prepareMatchText(
+    value
+  ) {
+    const text =
+      cleanLower(value);
+
+    const words =
+      text
+        .split(/\s+/)
+        .filter(
+          (word) =>
+            word.length > 2
+        );
+
+    return {
+      text,
+      words,
+      wordSet:
+        new Set(words)
+    };
+  }
+
+  function scorePrepared(
+    a,
+    b
+  ) {
+    if (
+      a.text === b.text
+    ) {
+      return 100;
+    }
+
+    if (
+      b.text.startsWith(
+        a.text
+      ) ||
+      a.text.startsWith(
+        b.text
+      )
+    ) {
+      return 90;
+    }
+
+    if (
+      b.text.includes(
+        a.text
+      ) ||
+      a.text.includes(
+        b.text
+      )
+    ) {
+      return 75;
+    }
+
+    if (
+      a.words.length === 0
+    ) {
+      return 0;
+    }
+
+    let hits = 0;
+
+    for (
+      const word of a.words
+    ) {
+      if (
+        b.wordSet.has(word)
+      ) {
+        hits++;
+      }
+    }
+
+    return Math.round(
+      (
+        hits /
+        a.words.length
+      ) * 60
+    );
+  }
+
+  function scoreMatch(
+    label,
+    candidate
+  ) {
+    return scorePrepared(
+      prepareMatchText(label),
+      prepareMatchText(candidate)
+    );
+  }
+
+  function indexPanel(
+    panelEl
+  ) {
+    const controls =
+      getVisibleControls(
+        panelEl
+      );
+
+    const switches = [];
+    const checkboxes = [];
+    const numbers = [];
+    const fields = [];
+    const radioEls = [];
+
+    const add =
+      (
+        list,
+        el,
+        label
+      ) => {
+        list.push({
+          el,
+          label,
+          match:
+            prepareMatchText(
+              label
+            )
+        });
+      };
+
+    for (
+      const el of controls
+    ) {
+      const role =
+        cleanLower(
+          el.getAttribute(
+            "role"
+          ) || ""
+        );
+
+      const type =
+        cleanLower(
+          el.getAttribute(
+            "type"
+          ) || ""
+        );
+
+      const tag =
+        el.tagName;
+
+      if (
+        role === "switch"
+      ) {
+        add(
+          switches,
+          el,
+          extractLabel(el)
+        );
+      }
+
+      else if (
+        type === "checkbox" ||
+        role === "checkbox"
+      ) {
+        add(
+          checkboxes,
+          el,
+          extractCheckboxLabel(el)
+        );
+      }
+
+      else if (
+        type === "radio" ||
+        role === "radio"
+      ) {
+        radioEls.push(el);
+      }
+
+      else if (
+        type === "number"
+      ) {
+        add(
+          numbers,
+          el,
+          extractNumberLabel(el)
+        );
+      }
+
+      else if (
+        tag === "TEXTAREA" ||
+        tag === "SELECT" ||
+        role === "combobox" ||
+        (
+          tag === "INPUT" &&
+          (
+            type === "text" ||
+            !type
+          )
+        )
+      ) {
+        add(
+          fields,
+          el,
+          extractNumberLabel(el)
+        );
+      }
+    }
+
+    const seenGroups =
+      new Set();
+
+    const radioGroups = [];
+
+    const namedGroups =
+      new Map();
+
+    for (
+      const rad of radioEls
+    ) {
+      const name =
+        rad.getAttribute(
+          "name"
+        );
+
+      if (!name) {
+        continue;
+      }
+
+      if (
+        !namedGroups.has(name)
+      ) {
+        namedGroups.set(
+          name,
+          []
+        );
+      }
+
+      namedGroups
+        .get(name)
+        .push(rad);
+    }
+
+    for (
+      const rad of radioEls
+    ) {
+      const name =
+        rad.getAttribute(
+          "name"
+        );
+
+      const group =
+        name
+          ? namedGroups.get(
+              name
+            )
+          : getRadioGroup(
+              rad
+            );
+
+      const key =
+        group
+          .map(
+            (r) =>
+              r.getAttribute(
+                "id"
+              ) ||
+              r.getAttribute(
+                "name"
+              ) ||
+              extractRadioOptionLabel(
+                r
+              )
+          )
+          .join("||");
+
+      if (
+        seenGroups.has(key)
+      ) {
+        continue;
+      }
+
+      seenGroups.add(key);
+
+      const label =
+        extractRadioGroupLabel(
+          rad,
+          group
+        );
+
+      const options =
+        group.map(
+          (el) => {
+            const optionLabel =
+              extractRadioOptionLabel(
+                el
+              );
+
+            return {
+              el,
+              label:
+                optionLabel,
+              match:
+                prepareMatchText(
+                  optionLabel
+                )
+            };
+          }
+        );
+
+      radioGroups.push({
+        group,
+        label,
+        match:
+          prepareMatchText(
+            label
+          ),
+        options,
+      });
+    }
+
+    return {
+      switches,
+      checkboxes,
+      numbers,
+      fields,
+      radioGroups,
+      controls,
+      controlSet:
+        new Set(controls),
+    };
+  }
+
+  function visibleControlsChanged(
+    index,
+    root
+  ) {
+    const current =
+      getVisibleControls(
+        root
+      );
+
+    if (
+      current.length !==
+      index.controls.length
+    ) {
+      return true;
+    }
+
+    return current.some(
+      (el) =>
+        !index.controlSet.has(el)
+    );
+  }
+  function findBestSwitch(index, label, used = new WeakSet()) {
+    let best = null;
+    let bestScore = 0;
+    const target = prepareMatchText(label);
+
+    for (const { el, label: candidate, match } of index.switches) {
+      if (used.has(el)) continue;
+
+      const score = scorePrepared(target, match);
+
+      if (score > bestScore) {
+        bestScore = score;
+        best = {
+          sw: el,
+          score,
+          candidate
+        };
+      }
+    }
+
+    return bestScore >= 40
+      ? best
+      : null;
+  }
+
+  function findBestCheckbox(index, label, used = new WeakSet()) {
+    let best = null;
+    let bestScore = 0;
+    const target = prepareMatchText(label);
+
+    for (const { el, label: candidate, match } of index.checkboxes) {
+      if (used.has(el)) continue;
+
+      const score = scorePrepared(target, match);
+
+      if (score > bestScore) {
+        bestScore = score;
+        best = {
+          cb: el,
+          score,
+          candidate
+        };
+      }
+    }
+
+    return bestScore >= 40
+      ? best
+      : null;
+  }
+
+  function findBestNumberInput(index, label, used = new WeakSet()) {
+    let best = null;
+    let bestScore = 0;
+    const target = prepareMatchText(label);
+
+    for (const { el, label: candidate, match } of index.numbers) {
+      if (used.has(el)) continue;
+
+      const score = scorePrepared(target, match);
+
+      if (score > bestScore) {
+        bestScore = score;
+        best = {
+          input: el,
+          score,
+          candidate
+        };
+      }
+    }
+
+    return bestScore >= 40
+      ? best
+      : null;
+  }
+
+  function findBestField(index, label, used = new WeakSet()) {
+    let best = null;
+    let bestScore = 0;
+    const target = prepareMatchText(label);
+
+    for (const { el, label: candidate, match } of index.fields) {
+      if (used.has(el)) continue;
+
+      const score = scorePrepared(target, match);
+
+      if (score > bestScore) {
+        bestScore = score;
+        best = {
+          field: el,
+          score,
+          candidate
+        };
+      }
+    }
+
+    return bestScore >= 40
+      ? best
+      : null;
+  }
+
+  function findBestRadioGroup(index, label, value, used = new WeakSet()) {
+    let best = null;
+    let bestScore = 0;
+
+    const labelTarget =
+      prepareMatchText(label);
+
+    const valueTarget =
+      prepareMatchText(value);
+
+    for (
+      const {
+        group,
+        label: candidate,
+        match,
+        options
+      } of index.radioGroups
+    ) {
+      if (
+        group.some(
+          (radio) =>
+            used.has(radio)
+        )
+      ) {
+        continue;
+      }
+
+      const groupScore =
+        scorePrepared(
+          labelTarget,
+          match
+        );
+
+      let option = null;
+      let optionScore = 0;
+
+      for (
+        const entry of options
+      ) {
+        const score =
+          scorePrepared(
+            valueTarget,
+            entry.match
+          );
+
+        if (
+          score >
+          optionScore
+        ) {
+          optionScore = score;
+          option = entry.el;
+        }
+      }
+
+      const combined =
+        !label ||
+        label === "UNKNOWN"
+          ? optionScore
+          : Math.round(
+              (
+                groupScore * 0.7
+              ) +
+              (
+                optionScore * 0.3
+              )
+            );
+
+      if (
+        combined >
+        bestScore
+      ) {
+        bestScore =
+          combined;
+
+        best = {
+          group,
+          option,
+          score:
+            combined,
+          candidate
+        };
+      }
+    }
+
+    return (
+      bestScore >= 40 &&
+      best?.option
+    )
+      ? best
+      : null;
+  }
+
+  function getSwitchState(sw) {
+    const checked =
+      sw.getAttribute(
+        "aria-checked"
+      );
+
+    if (
+      checked === "true"
+    ) {
+      return true;
+    }
+
+    if (
+      checked === "false"
+    ) {
+      return false;
+    }
+
+    return (
+      sw.checked === true
+    );
+  }
+
+  function findConfirmDialog() {
+    const explicit =
+      Array.from(
+        document.querySelectorAll(
+          '[role="dialog"], [role="alertdialog"], .ant-modal:not(.ant-modal-hidden), .zm-modal, [class*="modal" i], [class*="dialog" i]'
+        )
+      ).find(
+        isVisible
+      );
+
+    if (explicit) {
+      return explicit;
+    }
+
+    const buttons =
+      Array.from(
+        document.querySelectorAll(
+          'button, [role="button"]'
+        )
+      ).filter(
+        isVisible
+      );
+
+    const cancelBtn =
+      buttons.find(
+        (b) =>
+          cleanLower(
+            b.innerText ||
+            b.textContent ||
+            ""
+          ).includes(
+            "cancel"
+          )
+      );
+
+    if (!cancelBtn) {
+      return null;
+    }
+
+    let node =
+      cancelBtn;
+
+    for (
+      let depth = 0;
+      depth < 6 &&
+      node;
+      depth++,
+      node =
+        node.parentElement
+    ) {
+      const siblings =
+        Array.from(
+          node.querySelectorAll(
+            'button, [role="button"]'
+          )
+        ).filter(
+          isVisible
+        );
+
+      if (
+        siblings.length >= 2
+      ) {
+        return node;
+      }
+    }
+
+    return null;
+  }
+
+  const CONFIRM_BAD = [
+    "cancel",
+    "back",
+    "close",
+    "dismiss",
+    "no",
+    "never mind",
+    "reject"
+  ];
+
+  const CONFIRM_GOOD = [
+    "apply",
+    "save",
+    "ok",
+    "yes",
+    "got it",
+    "confirm",
+    "turn on",
+    "turn off",
+    "disable",
+    "enable",
+    "remove",
+    "continue",
+    "proceed"
+  ];
+
+  function findConfirmAction(dialog) {
+    const buttons =
+      Array.from(
+        dialog.querySelectorAll(
+          "button, [role='button']"
+        )
+      ).filter(
+        (button) =>
+          isVisible(button) &&
+          !button.disabled
+      );
+
+    const notBad =
+      buttons.filter(
+        (button) => {
+          const text =
+            cleanLower(
+              button.innerText ||
+              button.textContent ||
+              ""
+            );
+
+          return (
+            !CONFIRM_BAD.some(
+              (word) =>
+                text.includes(
+                  word
+                )
+            )
+          );
+        }
+      );
+
+    const primary =
+      notBad.find(
+        (button) => {
+          const cls =
+            String(
+              button.className ||
+              ""
+            ).toLowerCase();
+
+          return (
+            cls.includes(
+              "primary"
+            ) ||
+            cls.includes(
+              "blue"
+            ) ||
+            cls.includes(
+              "submit"
+            ) ||
+            cls.includes(
+              "fill"
+            )
+          );
+        }
+      );
+
+    if (primary) {
+      return primary;
+    }
+
+    if (
+      notBad.length === 1
+    ) {
+      return notBad[0];
+    }
+
+    return (
+      notBad.find(
+        (button) => {
+          const text =
+            cleanLower(
+              button.innerText ||
+              button.textContent ||
+              ""
+            );
+
+          return (
+            CONFIRM_GOOD.some(
+              (word) =>
+                text.includes(
+                  word
+                )
+            )
+          );
+        }
+      ) ||
+      null
+    );
+  }
+
+  const confirmationController =
+    (() => {
+      let armedUntil = 0;
+      let busy = false;
+      let observer = null;
+      let scanScheduled = false;
+
+      const handled =
+        new WeakSet();
+
+      const scan =
+        async () => {
+          if (
+            busy ||
+            Date.now() >
+              armedUntil
+          ) {
+            return false;
+          }
+
+          const dialog =
+            findConfirmDialog();
+
+          if (
+            !dialog ||
+            handled.has(
+              dialog
+            )
+          ) {
+            return false;
+          }
+
+          const action =
+            findConfirmAction(
+              dialog
+            );
+
+          if (!action) {
+            return false;
+          }
+
+          busy = true;
+
+          handled.add(
+            dialog
+          );
+
+          action.click();
+
+          const dismissed =
+            await waitFor(
+              () =>
+                (
+                  !dialog.isConnected ||
+                  !isVisible(dialog)
+                )
+                  ? true
+                  : null,
+              1000,
+              30
+            );
+
+          if (dismissed) {
+            handled.delete(
+              dialog
+            );
+          }
+
+          busy = false;
+
+          return true;
+        };
+
+      const scheduleScan =
+        () => {
+          if (
+            scanScheduled ||
+            Date.now() >
+              armedUntil
+          ) {
+            return;
+          }
+
+          scanScheduled =
+            true;
+
+          queueMicrotask(
+            () => {
+              scanScheduled =
+                false;
+
+              void scan();
+            }
+          );
+        };
+
+      const ensureObserver =
+        () => {
+          if (
+            observer ||
+            !document.body
+          ) {
+            return;
+          }
+
+          observer =
+            new MutationObserver(
+              (records) => {
+                const outsideOwnPanel =
+                  records.some(
+                    (record) => {
+                      const target =
+                        record.target
+                          ?.nodeType ===
+                        Node.ELEMENT_NODE
+                          ? record.target
+                          : record.target
+                              ?.parentElement;
+
+                      return (
+                        !target
+                          ?.closest
+                          ?.(
+                            "#zsa-panel"
+                          )
+                      );
+                    }
+                  );
+
+                if (
+                  outsideOwnPanel
+                ) {
+                  scheduleScan();
+                }
+              }
+            );
+
+          observer.observe(
+            document.body,
+            {
+              childList: true,
+              subtree: true,
+              attributes: true,
+              attributeFilter: [
+                "class",
+                "style",
+                "aria-hidden",
+                "open"
+              ],
+            }
+          );
+        };
+
+      return {
+        arm(
+          timeout = 1800
+        ) {
+          armedUntil =
+            Math.max(
+              armedUntil,
+              Date.now() +
+                timeout
+            );
+
+          ensureObserver();
+          scheduleScan();
+        },
+
+        async waitUntilClear(
+          timeout = 1200
+        ) {
+          armedUntil =
+            Math.max(
+              armedUntil,
+              Date.now() +
+                timeout
+            );
+
+          await scan();
+
+          if (
+            !findConfirmDialog()
+          ) {
+            return true;
+          }
+
+          return Boolean(
+            await waitFor(
+              () =>
+                !findConfirmDialog()
+                  ? true
+                  : null,
+              timeout,
+              30
+            )
+          );
+        },
+
+        disarm() {
+          armedUntil = 0;
+        },
+      };
+    })();
+
+  async function setSwitch(
+    sw,
+    desired
+  ) {
+    const current =
+      getSwitchState(sw);
+
+    if (
+      current === desired
+    ) {
+      return false;
+    }
+
+    for (
+      let attempt = 0;
+      attempt < 2;
+      attempt++
+    ) {
+      confirmationController.arm();
+
+      sw.click();
+
+      const settled =
+        await waitFor(
+          () =>
+            getSwitchState(sw) ===
+            desired
+              ? true
+              : null,
+          1000,
+          30
+        );
+
+      if (settled) {
+        await confirmationController
+          .waitUntilClear(
+            1000
+          );
+
+        return true;
+      }
+    }
+
+    return (
+      getSwitchState(sw) ===
+      desired
+    );
+  }
+
+  async function setCheckbox(
+    cb,
+    desired
+  ) {
+    const current =
+      getCheckedState(cb);
+
+    if (
+      current === desired
+    ) {
+      return false;
+    }
+
+    for (
+      let attempt = 0;
+      attempt < 2;
+      attempt++
+    ) {
+      confirmationController.arm();
+
+      cb.click();
+
+      const settled =
+        await waitFor(
+          () =>
+            getCheckedState(cb) ===
+            desired
+              ? true
+              : null,
+          1000,
+          30
+        );
+
+      if (settled) {
+        await confirmationController
+          .waitUntilClear(
+            1000
+          );
+
+        await clickAssociatedSave(
+          cb
+        );
+
+        return true;
+      }
+    }
+
+    return (
+      getCheckedState(cb) ===
+      desired
+    );
+  }
+
+  async function setRadio(rad) {
+    if (
+      getCheckedState(rad)
+    ) {
+      return false;
+    }
+
+    for (
+      let attempt = 0;
+      attempt < 2;
+      attempt++
+    ) {
+      confirmationController.arm();
+
+      rad.click();
+
+      const settled =
+        await waitFor(
+          () =>
+            getCheckedState(rad)
+              ? true
+              : null,
+          1000,
+          30
+        );
+
+      if (settled) {
+        await confirmationController
+          .waitUntilClear(
+            1000
+          );
+
+        await clickAssociatedSave(
+          rad
+        );
+
+        return true;
+      }
+    }
+
+    return getCheckedState(
+      rad
+    );
+  }
+
+  function setNativeInputValue(
+    input,
+    value
+  ) {
+    const proto =
+      Object.getPrototypeOf(
+        input
+      );
+
+    const descriptor =
+      Object.getOwnPropertyDescriptor(
+        proto,
+        "value"
+      );
+
+    if (
+      descriptor?.set
+    ) {
+      descriptor.set.call(
+        input,
+        value
+      );
+    }
+    else {
+      input.value =
+        value;
+    }
+
+    input.dispatchEvent(
+      new Event(
+        "input",
+        {
+          bubbles: true
+        }
+      )
+    );
+
+    input.dispatchEvent(
+      new Event(
+        "change",
+        {
+          bubbles: true
+        }
+      )
+    );
+  }
+
+  async function setNumberInput(
+    input,
+    desired
+  ) {
+    const desiredText =
+      String(desired);
+
+    if (
+      String(
+        input.value
+      ) === desiredText
+    ) {
+      return false;
+    }
+
+    for (
+      let attempt = 0;
+      attempt < 2;
+      attempt++
+    ) {
+      input.focus();
+
+      input.select?.();
+
+      confirmationController.arm();
+
+      setNativeInputValue(
+        input,
+        desiredText
+      );
+
+      input.blur();
+
+      const settled =
+        await waitFor(
+          () =>
+            String(
+              input.value
+            ) === desiredText
+              ? true
+              : null,
+          1000,
+          30
+        );
+
+      if (settled) {
+        await confirmationController
+          .waitUntilClear(
+            1000
+          );
+
+        await clickAssociatedSave(
+          input
+        );
+
+        return true;
+      }
+    }
+
+    return (
+      String(
+        input.value
+      ) === desiredText
+    );
+  }
+
+  function getFieldValue(
+    field
+  ) {
+    if (
+      field.tagName ===
+      "SELECT"
+    ) {
+      return cleanText(
+        field.options[
+          field.selectedIndex
+        ]?.text ||
+        field.value ||
+        ""
+      );
+    }
+
+    return cleanText(
+      field.value ||
+      field.innerText ||
+      ""
+    );
+  }
+
+  async function setField(
+    field,
+    desired
+  ) {
+    const desiredText =
+      String(desired);
+
+    if (
+      scoreMatch(
+        desiredText,
+        getFieldValue(field)
+      ) >= 90
+    ) {
+      return false;
+    }
+
+    if (
+      field.tagName ===
+      "SELECT"
+    ) {
+      let best = null;
+      let bestScore = 0;
+
+      for (
+        const option of
+        Array.from(
+          field.options
+        )
+      ) {
+        const score =
+          scoreMatch(
+            desiredText,
+            option.text ||
+            option.value
+          );
+
+        if (
+          score >
+          bestScore
+        ) {
+          best =
+            option;
+
+          bestScore =
+            score;
+        }
+      }
+
+      if (
+        !best ||
+        bestScore < 40
+      ) {
+        return false;
+      }
+
+      confirmationController.arm();
+
+      setNativeInputValue(
+        field,
+        best.value
+      );
+    }
+
+    else if (
+      field.getAttribute(
+        "role"
+      ) === "combobox"
+    ) {
+      field.click();
+
+      const options =
+        await waitFor(
+          () => {
+            const visible =
+              Array.from(
+                document.querySelectorAll(
+                  '[role="option"], .zm-select-option, [class*="select-option"]'
+                )
+              ).filter(
+                isVisible
+              );
+
+            return visible.length
+              ? visible
+              : null;
+          },
+          1200,
+          60
+        );
+
+      if (!options) {
+        return false;
+      }
+
+      let best = null;
+      let bestScore = 0;
+
+      for (
+        const option of options
+      ) {
+        const score =
+          scoreMatch(
+            desiredText,
+            cleanText(
+              option.innerText ||
+              option.textContent ||
+              ""
+            )
+          );
+
+        if (
+          score >
+          bestScore
+        ) {
+          best =
+            option;
+
+          bestScore =
+            score;
+        }
+      }
+
+      if (
+        !best ||
+        bestScore < 40
+      ) {
+        return false;
+      }
+
+      confirmationController.arm();
+
+      best.click();
+    }
+
+    else {
+      field.focus();
+
+      field.select?.();
+
+      confirmationController.arm();
+
+      setNativeInputValue(
+        field,
+        desiredText
+      );
+
+      field.blur();
+    }
+
+    await confirmationController
+      .waitUntilClear(
+        1000
+      );
+
+    await clickAssociatedSave(
+      field
+    );
+
+    return Boolean(
+      await waitFor(
+        () =>
+          scoreMatch(
+            desiredText,
+            getFieldValue(
+              field
+            )
+          ) >= 75
+            ? true
+            : null,
+        1000,
+        60
+      )
+    );
+  }
+
+  const lockButtonCache =
+    new WeakMap();
+
+  function findLockButton(sw) {
+    const cached =
+      lockButtonCache.get(
+        sw
+      );
+
+    if (
+      cached?.isConnected
+    ) {
+      return cached;
+    }
+
+    let node = sw;
+
+    for (
+      let i = 0;
+      i < 8;
+      i++
+    ) {
+      node =
+        node.parentElement;
+
+      if (!node) {
+        break;
+      }
+
+      const siblingSwitches =
+        node.querySelectorAll(
+          'input[role="switch"], [role="switch"]'
+        );
+
+      if (
+        siblingSwitches.length >
+        1
+      ) {
+        break;
+      }
+
+      for (
+        const c of
+        Array.from(
+          node.querySelectorAll(
+            'button, [role="button"]'
+          )
+        ).filter(
+          isVisible
+        )
+      ) {
+        const ariaLabel =
+          cleanLower(
+            c.getAttribute(
+              "aria-label"
+            ) || ""
+          );
+
+        const title =
+          cleanLower(
+            c.getAttribute(
+              "title"
+            ) || ""
+          );
+
+        if (
+          !ariaLabel.includes(
+            "lock"
+          ) &&
+          !title.includes(
+            "lock"
+          )
+        ) {
+          continue;
+        }
+
+        if (
+          cleanText(
+            c.innerText || ""
+          )
+            .replace(
+              /\s+/g,
+              ""
+            )
+            .length > 6
+        ) {
+          continue;
+        }
+
+        lockButtonCache.set(
+          sw,
+          c
+        );
+
+        return c;
+      }
+    }
+
+    return null;
+  }
+
+  function getLockState(sw) {
+    const btn =
+      findLockButton(sw);
+
+    if (!btn) {
+      return null;
+    }
+
+    const pressed =
+      btn.getAttribute(
+        "aria-pressed"
+      );
+
+    if (
+      pressed === "true"
+    ) {
+      return true;
+    }
+
+    if (
+      pressed === "false"
+    ) {
+      return false;
+    }
+
+    const combined =
+      cleanLower(
+        btn.getAttribute(
+          "aria-label"
+        ) || ""
+      ) +
+      " " +
+      cleanLower(
+        btn.getAttribute(
+          "title"
+        ) || ""
+      );
+
+    if (
+      combined.includes(
+        "unlock"
+      )
+    ) {
+      return true;
+    }
+
+    if (
+      combined.includes(
+        "locked"
+      )
+    ) {
+      return true;
+    }
+
+    return false;
+  }
+
+  async function setLock(
+    sw,
+    desired
+  ) {
+    const initial =
+      getLockState(sw);
+
+    if (
+      initial === null ||
+      initial === desired
+    ) {
+      return false;
+    }
+
+    for (
+      let attempt = 0;
+      attempt < 2;
+      attempt++
+    ) {
+      const btn =
+        findLockButton(sw);
+
+      if (!btn) {
+        return false;
+      }
+
+      confirmationController.arm(
+        2400
+      );
+
+      btn.click();
+
+      const settled =
+        await waitFor(
+          () =>
+            getLockState(sw) ===
+            desired
+              ? true
+              : null,
+          2400,
+          30
+        );
+
+      if (settled) {
+        await confirmationController
+          .waitUntilClear(
+            1400
+          );
+
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  async function clickAssociatedSave(
+    control
+  ) {
+    let node =
+      control;
+
+    for (
+      let depth = 0;
+      node &&
+      depth < 12;
+      depth++,
+      node =
+        node.parentElement
+    ) {
+      const save =
+        Array.from(
+          node.querySelectorAll(
+            'button, [role="button"]'
+          )
+        ).find(
+          (button) =>
+            isVisible(button) &&
+            !button.disabled &&
+            cleanLower(
+              button.innerText ||
+              button.textContent ||
+              ""
+            ) === "save"
+        );
+
+      if (save) {
+        confirmationController.arm(
+          2400
+        );
+
+        save.click();
+
+        await confirmationController
+          .waitUntilClear(
+            1400
+          );
+
+        await waitFor(
+          () =>
+            (
+              !isVisible(save) ||
+              save.disabled
+            )
+              ? true
+              : null,
+          1200,
+          30
+        );
+
+        return true;
+      }
+
+      if (
+        node.classList?.contains(
+          "zoom-feature-settings__layout"
+        ) ||
+        node.classList?.contains(
+          "zoom-feature-settings__layout-row"
+        ) ||
+        (
+          node.id &&
+          node.id.startsWith(
+            "feature-"
+          )
+        )
+      ) {
+        break;
+      }
+    }
+
+    return false;
+  }
+  async function applySettings() {
+    if (!TEMPLATE) {
+      setStatus("❌ No JSON loaded.");
+      return;
+    }
+
+    applyBtn.disabled = true;
+
+    flushLog();
+
+    logEl.replaceChildren();
+    logEl.style.display = "block";
+
+    log(
+      "⚙ Zoom Settings Applier v9.1 merged started",
+      "head"
+    );
+
+    log(
+      "─".repeat(52),
+      "skip"
+    );
+
+    const startedAt =
+      Date.now();
+
+    try {
+      const settingItems =
+        TEMPLATE
+          .filter(
+            (item) => {
+              if (
+                ![
+                  "switch",
+                  "checkbox",
+                  "radio",
+                  "number",
+                  "text",
+                  "select"
+                ].includes(
+                  item.type
+                )
+              ) {
+                return false;
+              }
+
+              const searchableText =
+                cleanLower(
+                  `${item.label || ""} ${item.tab || ""} ${item.value || ""}`
+                );
+
+              return (
+                !searchableText.includes(
+                  "disclaimer"
+                )
+              );
+            }
+          )
+          .map(
+            (item) => ({
+              ...item,
+              _normalizedTab:
+                cleanLower(
+                  item.tab
+                )
+            })
+          );
+
+      log(
+        `📦 ${TEMPLATE.length} total settings, ${settingItems.length} supported setting(s) to apply`,
+        "skip"
+      );
+
+      log(
+        "",
+        "skip"
+      );
+
+      const tabNames =
+        getSidebarTabs()
+          .map(
+            (el) =>
+              cleanText(
+                el.innerText || ""
+              )
+          )
+          .filter(Boolean);
+
+      log(
+        `📚 Found ${tabNames.length} sidebar tabs`,
+        "skip"
+      );
+
+      log(
+        "",
+        "skip"
+      );
+
+      const summary = {};
+
+      let totalChanged = 0;
+      let totalCorrect = 0;
+      let totalNotFound = 0;
+      let totalLockChanged = 0;
+
+      const applyItemsToCurrentView =
+        async (
+          summaryName,
+          items
+        ) => {
+          let index =
+            indexPanel(
+              document.body
+            );
+
+          const usedControls =
+            new WeakSet();
+
+          log(
+            `  🔎 Indexed ${index.switches.length} switches, ${index.checkboxes.length} checkboxes, ${index.radioGroups.length} radio groups, ${index.numbers.length} numbers, ${index.fields.length} text/dropdowns`,
+            "skip"
+          );
+
+          const tabStats = {
+            changed: 0,
+            correct: 0,
+            notFound: 0,
+            locked: 0
+          };
+
+          let processedInTab = 0;
+
+          for (
+            const item of items
+          ) {
+            if (
+              ++processedInTab %
+                32 ===
+              0
+            ) {
+              await sleep(0);
+            }
+
+            try {
+              if (
+                !item.label
+              ) {
+                continue;
+              }
+
+              let didChange =
+                false;
+
+              if (
+                item.type ===
+                "switch"
+              ) {
+                const match =
+                  findBestSwitch(
+                    index,
+                    item.label,
+                    usedControls
+                  );
+
+                if (!match) {
+                  log(
+                    `  ⚠ Not found: ${item.label.slice(0, 80)}`,
+                    "warn"
+                  );
+
+                  tabStats.notFound++;
+                  totalNotFound++;
+
+                  continue;
+                }
+
+                const {
+                  sw,
+                  score
+                } = match;
+
+                usedControls.add(
+                  sw
+                );
+
+                const beforeState =
+                  getSwitchState(
+                    sw
+                  );
+
+                if (
+                  beforeState !==
+                  item.enabled
+                ) {
+                  const initialLockState =
+                    getLockState(
+                      sw
+                    );
+
+                  if (
+                    initialLockState ===
+                    true
+                  ) {
+                    const unlocked =
+                      await setLock(
+                        sw,
+                        false
+                      );
+
+                    if (unlocked) {
+                      tabStats.locked++;
+                      totalLockChanged++;
+                    }
+                  }
+                }
+
+                await setSwitch(
+                  sw,
+                  item.enabled
+                );
+
+                const afterState =
+                  getSwitchState(
+                    sw
+                  );
+
+                const valueApplied =
+                  afterState ===
+                  item.enabled;
+
+                didChange =
+                  beforeState !==
+                  afterState;
+
+                if (
+                  valueApplied &&
+                  beforeState !==
+                    item.enabled
+                ) {
+                  tabStats.changed++;
+                  totalChanged++;
+
+                  log(
+                    `  ✅ ${item.label.slice(0, 68)} → ${item.enabled ? "ON" : "OFF"} [${score}]`,
+                    "ok"
+                  );
+                }
+
+                else if (
+                  valueApplied
+                ) {
+                  tabStats.correct++;
+                  totalCorrect++;
+
+                  log(
+                    `  ✓ ${item.label.slice(0, 68)} already ${item.enabled ? "ON" : "OFF"}`,
+                    "skip"
+                  );
+                }
+
+                else {
+                  tabStats.notFound++;
+                  totalNotFound++;
+
+                  log(
+                    `  ⚠ Failed to set: ${item.label.slice(0, 68)} → ${item.enabled ? "ON" : "OFF"}`,
+                    "warn"
+                  );
+                }
+
+                if (
+                  typeof item.locked ===
+                  "boolean"
+                ) {
+                  const lockChanged =
+                    await setLock(
+                      sw,
+                      item.locked
+                    );
+
+                  if (
+                    lockChanged
+                  ) {
+                    tabStats.locked++;
+                    totalLockChanged++;
+
+                    log(
+                      `  🔒 ${item.label.slice(0, 68)} → ${item.locked ? "LOCKED" : "UNLOCKED"}`,
+                      "lock"
+                    );
+                  }
+                }
+              }
+
+              else if (
+                item.type ===
+                "checkbox"
+              ) {
+                const match =
+                  findBestCheckbox(
+                    index,
+                    item.label,
+                    usedControls
+                  );
+
+                if (!match) {
+                  log(
+                    `  ⚠ Checkbox not found: ${item.label.slice(0, 80)}`,
+                    "warn"
+                  );
+
+                  tabStats.notFound++;
+                  totalNotFound++;
+
+                  continue;
+                }
+
+                const before =
+                  getCheckedState(
+                    match.cb
+                  );
+
+                await setCheckbox(
+                  match.cb,
+                  item.enabled
+                );
+
+                usedControls.add(
+                  match.cb
+                );
+
+                const after =
+                  getCheckedState(
+                    match.cb
+                  );
+
+                const applied =
+                  after ===
+                  item.enabled;
+
+                didChange =
+                  before !==
+                  after;
+
+                if (
+                  applied &&
+                  before !==
+                    item.enabled
+                ) {
+                  tabStats.changed++;
+                  totalChanged++;
+
+                  log(
+                    `  ✅ ${item.label.slice(0, 68)} → ${item.enabled ? "CHECKED" : "UNCHECKED"} [${match.score}]`,
+                    "ok"
+                  );
+                }
+
+                else if (
+                  applied
+                ) {
+                  tabStats.correct++;
+                  totalCorrect++;
+
+                  log(
+                    `  ✓ ${item.label.slice(0, 68)} already ${item.enabled ? "CHECKED" : "UNCHECKED"}`,
+                    "skip"
+                  );
+                }
+
+                else {
+                  tabStats.notFound++;
+                  totalNotFound++;
+
+                  log(
+                    `  ⚠ Failed to set checkbox: ${item.label.slice(0, 68)}`,
+                    "warn"
+                  );
+                }
+              }
+
+              else if (
+                item.type ===
+                "radio"
+              ) {
+                const match =
+                  findBestRadioGroup(
+                    index,
+                    item.label,
+                    item.value,
+                    usedControls
+                  );
+
+                if (!match) {
+                  log(
+                    `  ⚠ Radio not found: ${item.label.slice(0, 80)} → ${String(item.value).slice(0, 40)}`,
+                    "warn"
+                  );
+
+                  tabStats.notFound++;
+                  totalNotFound++;
+
+                  continue;
+                }
+
+                const before =
+                  getCheckedState(
+                    match.option
+                  );
+
+                await setRadio(
+                  match.option
+                );
+
+                match.group.forEach(
+                  (radio) =>
+                    usedControls.add(
+                      radio
+                    )
+                );
+
+                const after =
+                  getCheckedState(
+                    match.option
+                  );
+
+                didChange =
+                  before !==
+                  after;
+
+                if (
+                  after &&
+                  !before
+                ) {
+                  tabStats.changed++;
+                  totalChanged++;
+
+                  log(
+                    `  ✅ ${item.label.slice(0, 56)} → ${String(item.value).slice(0, 40)} [${match.score}]`,
+                    "ok"
+                  );
+                }
+
+                else if (
+                  after
+                ) {
+                  tabStats.correct++;
+                  totalCorrect++;
+
+                  log(
+                    `  ✓ ${item.label.slice(0, 56)} already ${String(item.value).slice(0, 40)}`,
+                    "skip"
+                  );
+                }
+
+                else {
+                  tabStats.notFound++;
+                  totalNotFound++;
+
+                  log(
+                    `  ⚠ Failed to set radio: ${item.label.slice(0, 56)} → ${String(item.value).slice(0, 40)}`,
+                    "warn"
+                  );
+                }
+              }
+
+              else if (
+                item.type ===
+                "number"
+              ) {
+                const match =
+                  findBestNumberInput(
+                    index,
+                    item.label,
+                    usedControls
+                  );
+
+                if (!match) {
+                  log(
+                    `  ⚠ Number field not found: ${item.label.slice(0, 80)}`,
+                    "warn"
+                  );
+
+                  tabStats.notFound++;
+                  totalNotFound++;
+
+                  continue;
+                }
+
+                const desired =
+                  String(
+                    item.value
+                  );
+
+                const before =
+                  String(
+                    match.input.value
+                  );
+
+                await setNumberInput(
+                  match.input,
+                  item.value
+                );
+
+                usedControls.add(
+                  match.input
+                );
+
+                const after =
+                  String(
+                    match.input.value
+                  );
+
+                const applied =
+                  after ===
+                  desired;
+
+                didChange =
+                  before !==
+                  after;
+
+                if (
+                  applied &&
+                  before !==
+                    desired
+                ) {
+                  tabStats.changed++;
+                  totalChanged++;
+
+                  log(
+                    `  ✅ ${item.label.slice(0, 68)} → ${item.value} [${match.score}]`,
+                    "ok"
+                  );
+                }
+
+                else if (
+                  applied
+                ) {
+                  tabStats.correct++;
+                  totalCorrect++;
+
+                  log(
+                    `  ✓ ${item.label.slice(0, 68)} already ${item.value}`,
+                    "skip"
+                  );
+                }
+
+                else {
+                  tabStats.notFound++;
+                  totalNotFound++;
+
+                  log(
+                    `  ⚠ Failed to set number: ${item.label.slice(0, 68)} → ${item.value}`,
+                    "warn"
+                  );
+                }
+              }
+
+              else if (
+                item.type ===
+                  "text" ||
+                item.type ===
+                  "select"
+              ) {
+                const match =
+                  findBestField(
+                    index,
+                    item.label,
+                    usedControls
+                  );
+
+                if (!match) {
+                  log(
+                    `  ⚠ Field not found: ${item.label.slice(0, 80)}`,
+                    "warn"
+                  );
+
+                  tabStats.notFound++;
+                  totalNotFound++;
+
+                  continue;
+                }
+
+                const before =
+                  getFieldValue(
+                    match.field
+                  );
+
+                await setField(
+                  match.field,
+                  item.value
+                );
+
+                usedControls.add(
+                  match.field
+                );
+
+                const after =
+                  getFieldValue(
+                    match.field
+                  );
+
+                const applied =
+                  scoreMatch(
+                    String(
+                      item.value
+                    ),
+                    after
+                  ) >= 75;
+
+                didChange =
+                  before !==
+                  after;
+
+                if (
+                  applied &&
+                  scoreMatch(
+                    String(
+                      item.value
+                    ),
+                    before
+                  ) < 75
+                ) {
+                  tabStats.changed++;
+                  totalChanged++;
+
+                  log(
+                    `  ✅ ${item.label.slice(0, 68)} → ${item.value} [${match.score}]`,
+                    "ok"
+                  );
+                }
+
+                else if (
+                  applied
+                ) {
+                  tabStats.correct++;
+                  totalCorrect++;
+
+                  log(
+                    `  ✓ ${item.label.slice(0, 68)} already ${item.value}`,
+                    "skip"
+                  );
+                }
+
+                else {
+                  tabStats.notFound++;
+                  totalNotFound++;
+
+                  log(
+                    `  ⚠ Failed to set field: ${item.label.slice(0, 68)} → ${item.value}`,
+                    "warn"
+                  );
+                }
+              }
+
+              if (didChange) {
+                await nextFrame();
+
+                const activePanel =
+                  getActivePanel();
+
+                await expandAll(
+                  activePanel
+                );
+
+                if (
+                  visibleControlsChanged(
+                    index,
+                    document.body
+                  )
+                ) {
+                  index =
+                    indexPanel(
+                      document.body
+                    );
+                }
+              }
+            }
+
+            catch (err) {
+              console.error(
+                err
+              );
+
+              log(
+                `  💥 Error on setting: ${item.label?.slice(0, 50)} — ${err.message || err}`,
+                "err"
+              );
+            }
+          }
+
+          summary[
+            summaryName
+          ] = tabStats;
+
+          log(
+            "",
+            "skip"
+          );
+        };
+
+      for (
+        let i = 0;
+        i < tabNames.length;
+        i++
+      ) {
+        const tabName =
+          tabNames[i];
+
+        const tabNameLower =
+          cleanLower(
+            tabName
+          );
+
+        const tab =
+          getSidebarTabs()
+            .find(
+              (el) =>
+                cleanLower(
+                  el.innerText || ""
+                ) ===
+                tabNameLower
+            );
+
+        if (!tab) {
+          log(
+            `  ⚠ Tab element not found in DOM: ${tabName}`,
+            "warn"
+          );
+
+          continue;
+        }
+
+        if (
+          SKIP_TABS.some(
+            (skip) =>
+              tabNameLower.includes(
+                skip
+              )
+          )
+        ) {
+          log(
+            `⏭ Skipping: ${tabName}`,
+            "skip"
+          );
+
+          continue;
+        }
+
+        const tabItems =
+          settingItems.filter(
+            (item) => {
+              const itemTab =
+                item._normalizedTab;
+
+              return (
+                itemTab ===
+                  tabNameLower ||
+                itemTab.includes(
+                  tabNameLower
+                ) ||
+                tabNameLower.includes(
+                  itemTab
+                )
+              );
+            }
+          );
+
+        if (
+          tabItems.length ===
+          0
+        ) {
+          continue;
+        }
+
+        log(
+          `📂 [${i + 1}/${tabNames.length}] ${tabName} — ${tabItems.length} setting(s)`,
+          "head"
+        );
+
+        setStatus(
+          `Tab ${i + 1}/${tabNames.length}: ${tabName}`
+        );
+
+        try {
+          await openTab(
+            tab
+          );
+        }
+
+        catch (err) {
+          console.error(
+            err
+          );
+
+          log(
+            `  💥 Failed opening tab: ${tabName} — ${err.message || err}`,
+            "err"
+          );
+
+          continue;
+        }
+
+        if (
+          tabNameLower ===
+          "my notes"
+        ) {
+          const noteSections = [
+            {
+              name:
+                "My Notes",
+
+              summaryName:
+                "My Notes > My Notes",
+
+              items:
+                settingItems.filter(
+                  (item) =>
+                    item._normalizedTab ===
+                      "my notes" ||
+                    item._normalizedTab ===
+                      "my notes > my notes"
+                )
+            },
+
+            {
+              name:
+                "Deprecated Notes",
+
+              summaryName:
+                "My Notes > Deprecated Notes",
+
+              items:
+                settingItems.filter(
+                  (item) =>
+                    item._normalizedTab ===
+                      "my notes > deprecated notes" ||
+                    item._normalizedTab ===
+                      "deprecated notes"
+                )
+            }
+          ];
+
+          for (
+            const section of
+            noteSections
+          ) {
+            if (
+              !section.items.length
+            ) {
+              continue;
+            }
+
+            log(
+              `  🗂 ${section.summaryName} — ${section.items.length} setting(s)`,
+              "head"
+            );
+
+            setStatus(
+              `${section.summaryName}: locating nested tab…`
+            );
+
+            const innerTab =
+              await openNestedTab(
+                section.name,
+                tab
+              );
+
+            if (!innerTab) {
+              const missingStats = {
+                changed: 0,
+                correct: 0,
+                notFound:
+                  section.items.length,
+                locked: 0
+              };
+
+              summary[
+                section.summaryName
+              ] =
+                missingStats;
+
+              totalNotFound +=
+                section.items.length;
+
+              const nearby =
+                getNestedTabCandidates(
+                  section.name,
+                  tab
+                )
+                  .map(
+                    (el) =>
+                      cleanText(
+                        el.innerText ||
+                        el.textContent ||
+                        ""
+                      )
+                  )
+                  .filter(Boolean)
+                  .slice(
+                    0,
+                    5
+                  );
+
+              log(
+                `  ⚠ Inner tab not found after waiting: ${section.summaryName}${nearby.length ? ` (candidates: ${nearby.join(", ")})` : ""}`,
+                "warn"
+              );
+
+              continue;
+            }
+
+            setStatus(
+              `${section.summaryName}: ${section.items.length} setting(s)`
+            );
+
+            await applyItemsToCurrentView(
+              section.summaryName,
+              section.items
+            );
+          }
+
+          continue;
+        }
+
+        await applyItemsToCurrentView(
+          tabName,
+          tabItems
+        );
+      }
+
+      log(
+        "═".repeat(52),
+        "sum"
+      );
+
+      log(
+        "📊 SUMMARY BY TAB",
+        "sum"
+      );
+
+      log(
+        "═".repeat(52),
+        "sum"
+      );
+
+      const col = 28;
+
+      for (
+        const [tab, s] of
+        Object.entries(
+          summary
+        )
+      ) {
+        const pad =
+          tab
+            .slice(
+              0,
+              col
+            )
+            .padEnd(
+              col
+            );
+
+        const line =
+          `  ${pad}│ ✅ ${String(s.changed).padStart(2)} changed` +
+          `  ✓ ${String(s.correct).padStart(2)} ok` +
+          `  🔒 ${String(s.locked).padStart(2)} locks` +
+          (
+            s.notFound
+              ? `  ⚠ ${s.notFound} missing`
+              : ""
+          );
+
+        log(
+          line,
+          s.notFound > 0
+            ? "warn"
+            : "sum"
+        );
+      }
+
+      const elapsedSec =
+        (
+          (
+            Date.now() -
+            startedAt
+          ) /
+          1000
+        ).toFixed(1);
+
+      log(
+        "─".repeat(52),
+        "skip"
+      );
+
+      log(
+        `  Toggles changed:     ${totalChanged}`,
+        "ok"
+      );
+
+      log(
+        `  Already correct:     ${totalCorrect}`,
+        "skip"
+      );
+
+      log(
+        `  Lock states changed: ${totalLockChanged}`,
+        "lock"
+      );
+
+      log(
+        `  Not found:           ${totalNotFound}`,
+        totalNotFound > 0
+          ? "warn"
+          : "skip"
+      );
+
+      log(
+        `  ⏱ Finished in:       ${elapsedSec}s`,
+        "sum"
+      );
+
+      log(
+        "═".repeat(52),
+        "sum"
+      );
+
+      setStatus(
+        `✅ Done in ${elapsedSec}s — ${totalChanged} changed, ${totalLockChanged} locks, ${totalNotFound} not found`
+      );
+    }
+
+    catch (err) {
+      console.error(
+        err
+      );
+
+      log(
+        `💥 Fatal error — stopped early: ${err.message || err}`,
+        "err"
+      );
+
+      setStatus(
+        `❌ Stopped — ${err.message || err}`
+      );
+    }
+
+    finally {
+      confirmationController
+        .disarm();
+
+      flushLog();
+
+      applyBtn.disabled =
+        false;
+    }
+  }
+
+  applyBtn.addEventListener(
+    "click",
+    applySettings
+  );
+})();

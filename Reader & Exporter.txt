@@ -1,0 +1,1289 @@
+// ==UserScript==
+// @name         Zoom Settings Reader & Exporter
+// @namespace    zoom.settings.reader
+// @version      3.2.0
+// @description  Reads all current Zoom account settings and exports them as JSON compatible with Zoom Settings Applier.
+// @match        https://zoom.us/account/setting*
+// @match        https://*.zoom.us/account/setting*
+// @grant        GM_addStyle
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function isVisible(el) {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 && el.offsetParent !== null;
+  }
+
+  function cleanText(t) {
+    return (t || "").replace(/\s+/g, " ").trim();
+  }
+
+  // ── Logging UI ────────────────────────────────────────────────────────────
+
+  GM_addStyle(`
+    #zsr-panel {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      z-index: 999999999;
+      font-family: Arial, sans-serif;
+      width: 400px;
+    }
+    #zsr-log {
+      width: 100%;
+      max-height: 360px;
+      overflow-y: auto;
+      background: #0f172a;
+      color: #e2e8f0;
+      border-radius: 12px;
+      border: 2px solid #7c3aed;
+      padding: 12px 14px;
+      margin-bottom: 10px;
+      display: none;
+      white-space: pre-wrap;
+      font-size: 12px;
+      line-height: 1.6;
+      box-sizing: border-box;
+    }
+    #zsr-log .ok   { color: #4ade80; }
+    #zsr-log .info { color: #67e8f9; font-weight: bold; }
+    #zsr-log .warn { color: #fbbf24; }
+    #zsr-log .skip { color: #94a3b8; }
+    #zsr-log .sum  { color: #f0abfc; }
+    #zsr-controls {
+      display: flex;
+      gap: 8px;
+    }
+    #zsr-read-btn, #zsr-export-btn {
+      flex: 1;
+      border: none;
+      border-radius: 10px;
+      padding: 11px 14px;
+      font-weight: 800;
+      font-size: 13px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    #zsr-read-btn {
+      background: linear-gradient(135deg, #7c3aed, #d946ef);
+      color: white;
+    }
+    #zsr-export-btn {
+      background: linear-gradient(135deg, #0ea5e9, #6366f1);
+      color: white;
+    }
+    #zsr-export-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+    #zsr-status {
+      width: 100%;
+      text-align: center;
+      color: #94a3b8;
+      font-size: 11px;
+      margin-top: 6px;
+      display: none;
+    }
+  `);
+
+  const panel = document.createElement("div");
+  panel.id = "zsr-panel";
+  panel.innerHTML = `
+    <div id="zsr-log"></div>
+    <div id="zsr-controls">
+      <button id="zsr-read-btn">📖 Read Settings</button>
+      <button id="zsr-export-btn" disabled>💾 Export JSON</button>
+    </div>
+    <div id="zsr-status"></div>
+  `;
+  document.body.appendChild(panel);
+
+  const readBtn = document.getElementById("zsr-read-btn");
+  const exportBtn = document.getElementById("zsr-export-btn");
+  const logEl = document.getElementById("zsr-log");
+  const statusEl = document.getElementById("zsr-status");
+
+  let collectedSettings = [];
+
+  function log(msg, cls) {
+    logEl.style.display = "block";
+    const line = document.createElement("div");
+    if (cls) line.className = cls;
+    line.textContent = msg;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function setStatus(msg) {
+    statusEl.style.display = "block";
+    statusEl.textContent = msg;
+  }
+
+  // ── Tab helpers ───────────────────────────────────────────────────────────
+
+  function getSidebarTabs() {
+    return Array.from(
+      document.querySelectorAll('.zoom-tabs__item, .tabs-item, [role="tab"], li[class*="tab"]')
+    ).filter((el) => isVisible(el) && cleanText(el.innerText || "").length > 0);
+  }
+
+  function getActivePanel() {
+    const panels = Array.from(document.querySelectorAll(
+      '[role="tabpanel"], .tab-panel, .tabs-panel, [class*="tab-content"]'
+    )).filter((panel) =>
+      isVisible(panel) && panel.getAttribute("aria-hidden") !== "true" && !panel.hidden
+    );
+    if (!panels.length) return document.body;
+
+    const selector = '[role="switch"], input[type="checkbox"], input[type="radio"], input[type="number"], input[type="text"], textarea, select, [role="combobox"]';
+    panels.sort((a, b) => b.querySelectorAll(selector).length - a.querySelectorAll(selector).length);
+    return panels[0];
+  }
+
+  function getScrollTargets(panel) {
+    const candidates = [document.scrollingElement, document.documentElement, document.body];
+    let node = panel;
+    while (node) {
+      candidates.push(node);
+      node = node.parentElement;
+    }
+    document.querySelectorAll(
+      '.settings-content, main, [class*="content-wrapper"], [class*="main-content"], [class*="scroll"]'
+    ).forEach((el) => candidates.push(el));
+    return [...new Set(candidates)].filter((el) =>
+      el && el.scrollHeight > el.clientHeight + 40
+    );
+  }
+
+  // ── expandAll — scoped, skips nav/header/avatar buttons ─────────────────
+  async function expandAll(scope) {
+    const root = scope || getActivePanel();
+    const candidates = Array.from(
+      root.querySelectorAll('button, [role="button"]')
+    ).filter(isVisible);
+
+    for (const el of candidates) {
+      const txt = cleanText(el.innerText || "").toLowerCase();
+
+      if (
+        el.closest('[class*="header"]') ||
+        el.closest('[class*="topbar"]') ||
+        el.closest('[class*="profile"]') ||
+        el.closest('[class*="avatar"]') ||
+        el.closest('[class*="account"]') ||
+        txt.includes("sign out") ||
+        txt.includes("billing") ||
+        txt.includes("account")
+      ) continue;
+
+      if (
+        txt.includes("show more") ||
+        txt.includes("see more") ||
+        txt.includes("advanced") ||
+        txt === "expand"
+      ) {
+        try { el.click(); await sleep(80); } catch (_) {}
+      }
+    }
+  }
+
+  // ── scrollPageFully ───────────────────────────────────────────────────────
+
+  async function scrollPageFully() {
+    let stablePasses = 0;
+    let previousControlCount = 0;
+
+    for (let pass = 0; pass < 12 && stablePasses < 2; pass++) {
+      const panel = getActivePanel();
+
+      for (const target of getScrollTargets(panel)) {
+        target.scrollTop = target.scrollHeight;
+      }
+
+      window.scrollTo(0, document.documentElement.scrollHeight);
+      await sleep(220);
+      await expandAll(getActivePanel());
+
+      const count = getActivePanel().querySelectorAll(
+        '[role="switch"], input[type="checkbox"], input[type="radio"], input[type="number"], input[type="text"], textarea, select, [role="combobox"]'
+      ).length;
+
+      stablePasses = count === previousControlCount ? stablePasses + 1 : 0;
+      previousControlCount = count;
+    }
+
+    for (const target of getScrollTargets(getActivePanel())) {
+      target.scrollTop = 0;
+    }
+
+    window.scrollTo(0, 0);
+    await sleep(120);
+  }
+
+  async function openTab(tabEl) {
+    tabEl.scrollIntoView({
+      behavior: "instant",
+      block: "center"
+    });
+
+    await sleep(100);
+    tabEl.click();
+
+    await sleep(1800);
+
+    await expandAll(getActivePanel());
+    await scrollPageFully();
+  }
+
+  // ── Switch reading ────────────────────────────────────────────────────────
+
+  function getSwitchState(sw) {
+    const checked = sw.getAttribute("aria-checked");
+
+    if (checked === "true") return true;
+    if (checked === "false") return false;
+
+    return sw.checked === true;
+  }
+
+  function getCheckedState(el) {
+    const checked = el.getAttribute("aria-checked");
+
+    if (checked === "true") return true;
+    if (checked === "false") return false;
+
+    return el.checked === true;
+  }
+
+  function getFeatureContainer(el) {
+    let node = el;
+
+    for (let depth = 0; depth < 12; depth++) {
+      node = node.parentElement;
+      if (!node) break;
+
+      if (
+        node.classList.contains("zoom-feature-settings__layout") ||
+        node.classList.contains("zoom-feature-settings__layout-row") ||
+        (node.id && node.id.startsWith("feature-"))
+      ) {
+        return node;
+      }
+    }
+
+    return null;
+  }
+
+  function extractFeatureName(el) {
+    const node = getFeatureContainer(el);
+
+    if (!node) return "";
+
+    const nameEl =
+      node.querySelector(".zoom-feature-settings__name") ||
+      node.querySelector('h4[id$="-title"]') ||
+      node.querySelector("h4");
+
+    if (!nameEl) return "";
+
+    const clone = nameEl.cloneNode(true);
+
+    clone.querySelectorAll(
+      '.zoom-badge, .badge, [class*="badge"], [class*="tag"], [aria-hidden]'
+    ).forEach((b) => b.remove());
+
+    return cleanText(
+      clone.innerText ||
+      clone.textContent ||
+      ""
+    );
+  }
+
+  function extractInlineLabel(el) {
+    const id = el.getAttribute("id");
+
+    if (id) {
+      const direct =
+        document.querySelector(`label[for="${CSS.escape(id)}"]`);
+
+      const directText =
+        cleanText(
+          direct?.innerText ||
+          direct?.textContent ||
+          ""
+        );
+
+      if (directText) return directText;
+    }
+
+    const wrappingLabel = el.closest("label");
+
+    const wrappingText =
+      cleanText(
+        wrappingLabel?.innerText ||
+        wrappingLabel?.textContent ||
+        ""
+      );
+
+    if (wrappingText) return wrappingText;
+
+    let sibling = el.nextElementSibling;
+
+    for (
+      let i = 0;
+      sibling && i < 3;
+      i++, sibling = sibling.nextElementSibling
+    ) {
+      const txt =
+        cleanText(
+          sibling.innerText ||
+          sibling.textContent ||
+          ""
+        );
+
+      if (txt && txt.length < 160) return txt;
+    }
+
+    const parentText =
+      cleanText(
+        el.parentElement?.innerText ||
+        el.parentElement?.textContent ||
+        ""
+      );
+
+    if (
+      parentText &&
+      parentText.length < 180
+    ) {
+      return parentText;
+    }
+
+    return "";
+  }
+
+  function extractTextBeforeElement(el) {
+    const parent = el.parentElement;
+
+    if (!parent) return "";
+
+    try {
+      const range = document.createRange();
+
+      range.setStart(parent, 0);
+      range.setEndBefore(el);
+
+      return cleanText(range.toString())
+        .replace(/[:\s]+$/, "");
+    }
+    catch (_) {
+      return "";
+    }
+  }
+
+  function extractCheckboxLabel(cb) {
+    const inline = extractInlineLabel(cb);
+    const feature = extractFeatureName(cb);
+
+    if (
+      inline &&
+      feature &&
+      inline.toLowerCase() !== feature.toLowerCase()
+    ) {
+      return `${feature} / ${inline}`;
+    }
+
+    return inline || feature || "UNKNOWN";
+  }
+
+  function getRadioGroup(rad) {
+    const name = rad.getAttribute("name");
+
+    if (name) {
+      const radios =
+        Array.from(
+          document.querySelectorAll(
+            `input[type="radio"][name="${CSS.escape(name)}"], [role="radio"][name="${CSS.escape(name)}"]`
+          )
+        ).filter(isVisible);
+
+      if (radios.length > 0) return radios;
+    }
+
+    let node = rad.parentElement;
+
+    for (
+      let depth = 0;
+      node && depth < 10;
+      depth++, node = node.parentElement
+    ) {
+      const radios =
+        Array.from(
+          node.querySelectorAll(
+            'input[type="radio"], [role="radio"]'
+          )
+        ).filter(isVisible);
+
+      if (radios.length > 1) return radios;
+    }
+
+    return [rad];
+  }
+
+  function extractRadioOptionLabel(rad) {
+    return (
+      extractInlineLabel(rad) ||
+      cleanText(
+        rad.getAttribute("aria-label") ||
+        ""
+      )
+    );
+  }
+
+  function extractRadioGroupLabel(rad, radios) {
+    const feature = extractFeatureName(rad);
+    let group = rad.parentElement;
+
+    for (
+      let depth = 0;
+      group && depth < 10;
+      depth++, group = group.parentElement
+    ) {
+      const groupRadios =
+        Array.from(
+          group.querySelectorAll(
+            'input[type="radio"], [role="radio"]'
+          )
+        ).filter(isVisible);
+
+      if (groupRadios.length >= radios.length) break;
+    }
+
+    let text =
+      cleanText(
+        group?.innerText ||
+        group?.textContent ||
+        ""
+      );
+
+    for (
+      const option of
+      radios
+        .map(extractRadioOptionLabel)
+        .filter(Boolean)
+    ) {
+      text =
+        cleanText(
+          text.replace(option, " ")
+        );
+    }
+
+    text =
+      cleanText(
+        text
+          .replace(/\?/g, "? ")
+          .replace(/\s+/g, " ")
+      );
+
+    if (
+      text.length > 2 &&
+      text.length < 180
+    ) {
+      return feature &&
+        !text.includes(feature)
+        ? `${feature} / ${text}`
+        : text;
+    }
+
+    return (
+      feature ||
+      cleanText(
+        rad.getAttribute("aria-label") ||
+        ""
+      ) ||
+      "UNKNOWN"
+    );
+  }
+
+  function extractNumberLabel(input) {
+    const before =
+      extractTextBeforeElement(input);
+
+    const inline =
+      before &&
+      before.length < 80
+        ? before
+        : extractInlineLabel(input);
+
+    const feature =
+      extractFeatureName(input);
+
+    if (
+      inline &&
+      feature &&
+      inline.toLowerCase() !== feature.toLowerCase()
+    ) {
+      return `${feature} / ${inline.replace(/:$/, "")}`;
+    }
+
+    return (
+      inline ||
+      feature ||
+      cleanText(
+        input.getAttribute("aria-label") ||
+        ""
+      ) ||
+      "UNKNOWN"
+    );
+  }
+
+  function requiresSave(control) {
+    let node = control;
+
+    for (
+      let depth = 0;
+      node && depth < 12;
+      depth++, node = node.parentElement
+    ) {
+      const save =
+        Array.from(
+          node.querySelectorAll(
+            'button, [role="button"]'
+          )
+        ).find((button) =>
+          isVisible(button) &&
+          cleanText(
+            button.innerText ||
+            button.textContent ||
+            ""
+          ).toLowerCase() === "save"
+        );
+
+      if (save) return true;
+
+      if (
+        node.classList?.contains(
+          "zoom-feature-settings__layout"
+        ) ||
+        node.classList?.contains(
+          "zoom-feature-settings__layout-row"
+        ) ||
+        (
+          node.id &&
+          node.id.startsWith("feature-")
+        )
+      ) {
+        break;
+      }
+    }
+
+    return false;
+  }
+
+  function extractLabel(sw) {
+    let node = sw;
+
+    for (let depth = 0; depth < 12; depth++) {
+      node = node.parentElement;
+
+      if (!node) break;
+
+      if (
+        node.classList.contains(
+          "zoom-feature-settings__layout"
+        ) ||
+        node.classList.contains(
+          "zoom-feature-settings__layout-row"
+        ) ||
+        (
+          node.id &&
+          node.id.startsWith("feature-")
+        )
+      ) {
+        const nameEl =
+          node.querySelector(
+            ".zoom-feature-settings__name"
+          ) ||
+          node.querySelector(
+            'h4[id$="-title"]'
+          ) ||
+          node.querySelector("h4");
+
+        if (nameEl) {
+          const clone =
+            nameEl.cloneNode(true);
+
+          clone.querySelectorAll(
+            '.zoom-badge, .badge, [class*="badge"], [class*="tag"], [aria-hidden]'
+          ).forEach((b) => b.remove());
+
+          const text =
+            cleanText(
+              clone.innerText ||
+              clone.textContent ||
+              ""
+            );
+
+          if (
+            text.length > 2 &&
+            text.length < 120
+          ) {
+            return text;
+          }
+        }
+
+        break;
+      }
+    }
+
+    const ariaLabel =
+      cleanText(
+        sw.getAttribute("aria-label") ||
+        ""
+      )
+        .replace(
+          /,\s*(NEW|BETA|PREMIUM)$/i,
+          ""
+        )
+        .trim();
+
+    if (
+      ariaLabel.length > 2 &&
+      ariaLabel.length < 120
+    ) {
+      return ariaLabel;
+    }
+
+    return "UNKNOWN";
+  }
+
+  function getLockState(sw) {
+    let node = sw;
+
+    for (let i = 0; i < 8; i++) {
+      node = node.parentElement;
+
+      if (!node) break;
+
+      const siblings =
+        node.querySelectorAll(
+          'input[role="switch"], [role="switch"]'
+        );
+
+      if (siblings.length > 1) break;
+
+      const lockBtn =
+        node.querySelector(
+          '.zoom-feature-settings__toggle-lock'
+        ) ||
+        Array.from(
+          node.querySelectorAll(
+            'button, [role="button"]'
+          )
+        ).find((b) => {
+          const label =
+            (
+              b.getAttribute("aria-label") ||
+              ""
+            ).toLowerCase();
+
+          const title =
+            (
+              b.getAttribute("title") ||
+              ""
+            ).toLowerCase();
+
+          return (
+            (
+              label.includes("lock") ||
+              title.includes("lock")
+            ) &&
+            cleanText(
+              b.innerText || ""
+            ).replace(/\s+/g, "").length <= 6
+          );
+        });
+
+      if (!lockBtn) continue;
+
+      const pressed =
+        lockBtn.getAttribute(
+          "aria-pressed"
+        );
+
+      if (pressed === "true") return true;
+      if (pressed === "false") return false;
+
+      const combined =
+        (
+          lockBtn.getAttribute(
+            "aria-label"
+          ) || ""
+        ).toLowerCase() +
+        " " +
+        (
+          lockBtn.getAttribute(
+            "title"
+          ) || ""
+        ).toLowerCase();
+
+      if (combined.includes("unlock")) {
+        return true;
+      }
+
+      if (combined.includes("locked")) {
+        return true;
+      }
+
+      return false;
+    }
+
+    return null;
+  }
+
+  async function readAllSettings() {
+    if (
+      !window.location.href.includes(
+        "/account/setting"
+      )
+    ) {
+      setStatus(
+        "❌ Must be on zoom.us/account/setting"
+      );
+      return;
+    }
+
+    readBtn.disabled = true;
+    exportBtn.disabled = true;
+    collectedSettings = [];
+    logEl.innerHTML = "";
+    logEl.style.display = "block";
+
+    log(
+      "📖 Zoom Settings Reader v3.2 started",
+      "info"
+    );
+
+    log(
+      "─".repeat(48),
+      "skip"
+    );
+
+    const tabNames =
+      getSidebarTabs()
+        .map((el) =>
+          cleanText(
+            el.innerText || ""
+          )
+        )
+        .filter(Boolean);
+
+    log(
+      `Found ${tabNames.length} sidebar tab(s)`,
+      "skip"
+    );
+
+    log("", "skip");
+
+    const SKIP_TABS = [
+      "webinar",
+      "events",
+      "mail",
+      "calendar",
+      "zoom chat",
+      "team chat"
+    ];
+
+    for (
+      let i = 0;
+      i < tabNames.length;
+      i++
+    ) {
+      const tabName = tabNames[i];
+      const tabLower =
+        tabName.toLowerCase();
+
+      if (
+        SKIP_TABS.some((s) =>
+          tabLower.includes(s)
+        )
+      ) {
+        log(
+          `⏭ Skip: ${tabName}`,
+          "skip"
+        );
+
+        continue;
+      }
+
+      const tab =
+        getSidebarTabs().find(
+          (el) =>
+            cleanText(
+              el.innerText || ""
+            ).toLowerCase() === tabLower
+        );
+
+      if (!tab) {
+        log(
+          `  ⚠ Tab element gone from DOM: ${tabName}`,
+          "warn"
+        );
+
+        continue;
+      }
+
+      log(
+        `📂 [${i + 1}/${tabNames.length}] ${tabName}`,
+        "info"
+      );
+
+      setStatus(
+        `Reading ${i + 1}/${tabNames.length}: ${tabName}`
+      );
+
+      try {
+        await openTab(tab);
+      }
+      catch (err) {
+        log(
+          `  💥 Failed opening tab: ${tabName} — ${err.message || err}`,
+          "warn"
+        );
+
+        continue;
+      }
+
+      async function readVisibleControls(
+        exportTabName
+      ) {
+        const root = document.body;
+
+        const switches =
+          Array.from(
+            root.querySelectorAll(
+              'input[role="switch"], [role="switch"]'
+            )
+          ).filter(isVisible);
+
+        let count = 0;
+
+        for (const sw of switches) {
+          try {
+            const label =
+              extractLabel(sw);
+
+            const enabled =
+              getSwitchState(sw);
+
+            const locked =
+              getLockState(sw);
+
+            const entry = {
+              type: "switch",
+              tab: exportTabName,
+              label,
+              enabled
+            };
+
+            if (locked !== null) {
+              entry.locked = locked;
+            }
+
+            collectedSettings.push(entry);
+
+            count++;
+          }
+          catch (err) {
+            log(
+              `  💥 Error reading switch — ${err.message || err}`,
+              "warn"
+            );
+          }
+        }
+
+        const checkboxes =
+          Array.from(
+            root.querySelectorAll(
+              'input[type="checkbox"], [role="checkbox"]'
+            )
+          ).filter((el) =>
+            isVisible(el) &&
+            el.getAttribute("role") !==
+              "switch"
+          );
+
+        let checkboxCount = 0;
+
+        for (const cb of checkboxes) {
+          try {
+            const label =
+              extractCheckboxLabel(cb);
+
+            const enabled =
+              getCheckedState(cb);
+
+            collectedSettings.push({
+              type: "checkbox",
+              tab: exportTabName,
+              label,
+              enabled,
+              requiresSave:
+                requiresSave(cb)
+            });
+
+            checkboxCount++;
+          }
+          catch (err) {
+            log(
+              `  💥 Error reading checkbox — ${err.message || err}`,
+              "warn"
+            );
+          }
+        }
+
+        const radios =
+          Array.from(
+            root.querySelectorAll(
+              'input[type="radio"], [role="radio"]'
+            )
+          ).filter(isVisible);
+
+        const radioSeen = new Set();
+
+        let radioCount = 0;
+
+        for (const rad of radios) {
+          try {
+            const group =
+              getRadioGroup(rad);
+
+            const key =
+              group
+                .map((r) =>
+                  r.getAttribute("id") ||
+                  r.getAttribute("name") ||
+                  extractRadioOptionLabel(r)
+                )
+                .join("||");
+
+            if (radioSeen.has(key)) {
+              continue;
+            }
+
+            radioSeen.add(key);
+
+            const selected =
+              group.find(getCheckedState);
+
+            if (!selected) continue;
+
+            collectedSettings.push({
+              type: "radio",
+              tab: exportTabName,
+              label:
+                extractRadioGroupLabel(
+                  rad,
+                  group
+                ),
+              value:
+                extractRadioOptionLabel(
+                  selected
+                ),
+              requiresSave:
+                requiresSave(selected)
+            });
+
+            radioCount++;
+          }
+          catch (err) {
+            log(
+              `  💥 Error reading radio group — ${err.message || err}`,
+              "warn"
+            );
+          }
+        }
+
+        const numberInputs =
+          Array.from(
+            root.querySelectorAll(
+              'input[type="number"]'
+            )
+          ).filter(isVisible);
+
+        let numberCount = 0;
+
+        for (
+          const input of numberInputs
+        ) {
+          try {
+            collectedSettings.push({
+              type: "number",
+              tab: exportTabName,
+              label:
+                extractNumberLabel(input),
+              value: input.value,
+              requiresSave:
+                requiresSave(input)
+            });
+
+            numberCount++;
+          }
+          catch (err) {
+            log(
+              `  💥 Error reading number input — ${err.message || err}`,
+              "warn"
+            );
+          }
+        }
+
+        const fields =
+          Array.from(
+            root.querySelectorAll(
+              'input[type="text"], input:not([type]), textarea, select, [role="combobox"]'
+            )
+          ).filter((el) =>
+            isVisible(el) &&
+            !el.closest("#zsr-panel")
+          );
+
+        let fieldCount = 0;
+
+        for (const field of fields) {
+          try {
+            let value =
+              field.value || "";
+
+            if (
+              field.tagName === "SELECT"
+            ) {
+              value =
+                field.options[
+                  field.selectedIndex
+                ]?.text ||
+                field.value ||
+                "";
+            }
+
+            if (
+              field.getAttribute("role") ===
+                "combobox" &&
+              !value
+            ) {
+              value =
+                cleanText(
+                  field.innerText ||
+                  field.textContent ||
+                  ""
+                );
+            }
+
+            const type =
+              field.tagName === "SELECT" ||
+              field.getAttribute("role") ===
+                "combobox"
+                ? "select"
+                : "text";
+
+            collectedSettings.push({
+              type,
+              tab: exportTabName,
+              label:
+                extractNumberLabel(field),
+              value:
+                cleanText(value),
+              requiresSave:
+                requiresSave(field)
+            });
+
+            fieldCount++;
+          }
+          catch (err) {
+            log(
+              `  💥 Error reading text/dropdown field — ${err.message || err}`,
+              "warn"
+            );
+          }
+        }
+
+        log(
+          `  → ${count} switch(es), ${checkboxCount} checkbox(es), ${radioCount} radio group(s), ${numberCount} number field(s), ${fieldCount} text/dropdown field(s) read`,
+          "ok"
+        );
+      }
+
+      if (tabLower === "my notes") {
+        const innerTabNames = [
+          "My Notes",
+          "Deprecated Notes"
+        ];
+
+        let foundInnerTab = false;
+
+        for (
+          const innerName of innerTabNames
+        ) {
+          const innerLower =
+            innerName.toLowerCase();
+
+          const candidates =
+            Array.from(
+              document.querySelectorAll(
+                '[role="tab"], .zoom-tabs__item, .tabs-item, li[class*="tab"], button'
+              )
+            ).filter((el) =>
+              isVisible(el) &&
+              cleanText(
+                el.innerText ||
+                el.textContent ||
+                ""
+              ).toLowerCase() ===
+                innerLower &&
+              el !== tab
+            );
+
+          const innerTab =
+            candidates.find(
+              (el) =>
+                !el.closest(
+                  'nav, aside, [class*="sidebar"]'
+                )
+            ) ||
+            candidates[0];
+
+          if (!innerTab) {
+            log(
+              `  ⚠ Inner tab not found: ${innerName}`,
+              "warn"
+            );
+
+            continue;
+          }
+
+          foundInnerTab = true;
+
+          log(
+            `  🗂 My Notes → ${innerName}`,
+            "info"
+          );
+
+          innerTab.scrollIntoView({
+            behavior: "instant",
+            block: "center"
+          });
+
+          innerTab.click();
+
+          await sleep(1200);
+
+          await expandAll(
+            getActivePanel()
+          );
+
+          await scrollPageFully();
+
+          await readVisibleControls(
+            `My Notes > ${innerName}`
+          );
+        }
+
+        if (!foundInnerTab) {
+          log(
+            "  ⚠ No inner My Notes tabs detected; reading visible My Notes content as fallback",
+            "warn"
+          );
+
+          await readVisibleControls(
+            tabName
+          );
+        }
+      }
+      else {
+        await readVisibleControls(
+          tabName
+        );
+      }
+    }
+
+    log("", "skip");
+
+    log(
+      "═".repeat(48),
+      "sum"
+    );
+
+    log(
+      `✅ Total: ${collectedSettings.length} settings`,
+      "sum"
+    );
+
+    log(
+      "═".repeat(48),
+      "sum"
+    );
+
+    setStatus(
+      `✅ ${collectedSettings.length} settings read — click Export JSON`
+    );
+
+    readBtn.disabled = false;
+    exportBtn.disabled = false;
+  }
+
+  function exportJSON() {
+    if (!collectedSettings.length) {
+      setStatus(
+        "❌ Nothing to export — read first"
+      );
+      return;
+    }
+
+    const blob =
+      new Blob(
+        [
+          JSON.stringify(
+            collectedSettings,
+            null,
+            2
+          )
+        ],
+        {
+          type: "application/json"
+        }
+      );
+
+    const url =
+      URL.createObjectURL(blob);
+
+    const a =
+      document.createElement("a");
+
+    a.href = url;
+
+    a.download =
+      `zoom-settings-${new Date()
+        .toISOString()
+        .slice(0, 10)}.json`;
+
+    a.click();
+
+    URL.revokeObjectURL(url);
+
+    setStatus(
+      `💾 Exported ${collectedSettings.length} settings`
+    );
+  }
+
+  readBtn.addEventListener(
+    "click",
+    readAllSettings
+  );
+
+  exportBtn.addEventListener(
+    "click",
+    exportJSON
+  );
+
+})();
