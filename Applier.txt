@@ -2,6 +2,9 @@
 // @name         Zoom Settings Applier
 // @namespace    zoom.settings.applier
 // @version      9.1
+// @author       W ɪ ʟ ʟᴮᴿ
+// @homepage     https://github.com/thatwillbr
+// @supportURL   https://pnpatvip.com
 // @description  Applies exported Zoom account settings with fast event-driven waits plus robust nested My Notes / Deprecated Notes handling.
 // @match        https://zoom.us/account/setting*
 // @match        https://*.zoom.us/account/setting*

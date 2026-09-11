@@ -2,6 +2,9 @@
 // @name         Zoom Settings Reader & Exporter
 // @namespace    zoom.settings.reader
 // @version      3.2.0
+// @author       W ɪ ʟ ʟᴮᴿ
+// @homepage     https://github.com/thatwillbr
+// @supportURL   https://pnpatvip.com
 // @description  Reads all current Zoom account settings and exports them as JSON compatible with Zoom Settings Applier.
 // @match        https://zoom.us/account/setting*
 // @match        https://*.zoom.us/account/setting*
